@@ -1,0 +1,46 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model Project {
+  id        String   @id @default(uuid())
+  name      String
+  createdAt DateTime @default(now())
+  branches  Branch[]
+}
+
+model Branch {
+  id        String   @id @default(uuid())
+  name      String
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id])
+  head      Commit?  @relation("BranchHead", fields: [headId], references: [id])
+  headId    String?
+  commits   Commit[] @relation("BranchCommits")
+}
+
+model Commit {
+  id         String         @id @default(uuid())
+  message    String
+  createdAt  DateTime       @default(now())
+  parentId   String?
+  parent     Commit?        @relation("CommitHistory", fields: [parentId], references: [id])
+  children   Commit[]       @relation("CommitHistory")
+  snapshotId String         @unique
+  snapshot   SchemaSnapshot @relation(fields: [snapshotId], references: [id])
+  branchId   String
+  branch     Branch         @relation("BranchCommits", fields: [branchId], references: [id])
+  isHead     Boolean        @default(false)
+  branchHead Branch?        @relation("BranchHead")
+}
+
+model SchemaSnapshot {
+  id      String   @id @default(uuid())
+  content Json // The full schema representation as JSON
+  commits Commit[]
+}
