@@ -1,4 +1,4 @@
-const BASE_URL = "http://localhost:3001/api/projects";
+const BASE_URL = import.meta.env.VITE_API_BASE_URL;
 
 export const projectApi = {
   async importProject(name, sql) {
@@ -42,7 +42,7 @@ export const projectApi = {
 
   async compareBranches(branchA, branchB) {
     const res = await fetch(
-      `${BASE_URL}/diff?branchA=${branchA}&branchB=${branchB}&t=${Date.now()}`
+      `${BASE_URL}/diff?branchA=${branchA}&branchB=${branchB}&t=${Date.now()}`,
     );
     if (!res.ok) throw new Error("Comparison failed");
     return res.json();

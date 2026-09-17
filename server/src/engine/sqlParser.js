@@ -12,15 +12,27 @@ class SQLParser {
   static parse(sql) {
     const schema = {};
 
-    // Improved regex to handle different quoting and spacing
-    // Matches: CREATE TABLE [IF NOT EXISTS] `table_name` ( ... ) [OPTIONS];
-    // This version allows for table options (like ENGINE=InnoDB) before the semicolon.
-    const tableRegex = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`"']?([\w\.]+)[`"']?\s*\(([\s\S]*?)\)[^;]*;/gi;
+    // Match the start of CREATE TABLE and the first opening parenthesis
+    const tableStartRegex = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`"']?([\w\.]+)[`"']?\s*\(/gi;
     let match;
 
-    while ((match = tableRegex.exec(sql)) !== null) {
+    while ((match = tableStartRegex.exec(sql)) !== null) {
       const tableName = match[1];
-      const columnBlock = match[2];
+      const startPos = match.index + match[0].length;
+
+      // Manually find the matching closing parenthesis for the column block
+      let depth = 0;
+      let columnBlock = '';
+      for (let i = startPos; i < sql.length; i++) {
+        const char = sql[i];
+        if (char === '(') depth++;
+        if (char === ')') depth--;
+        if (depth === 0) {
+          columnBlock = sql.substring(startPos, i);
+          break;
+        }
+        columnBlock += char;
+      }
 
       schema[tableName] = {
         columns: this.parseColumns(columnBlock),
