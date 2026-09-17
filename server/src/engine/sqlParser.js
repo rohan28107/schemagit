@@ -20,13 +20,14 @@ class SQLParser {
       const tableName = match[1];
       const startPos = match.index + match[0].length;
 
-      // Manually find the matching closing parenthesis for the column block
-      let depth = 0;
+      // The tableStartRegex already matched the opening '(', so we start depth at 1
+      let depth = 1;
       let columnBlock = '';
       for (let i = startPos; i < sql.length; i++) {
         const char = sql[i];
         if (char === '(') depth++;
         if (char === ')') depth--;
+
         if (depth === 0) {
           columnBlock = sql.substring(startPos, i);
           break;
