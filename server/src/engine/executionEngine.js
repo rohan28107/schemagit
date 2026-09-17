@@ -8,6 +8,14 @@ class ExecutionEngine {
    */
   static async executeMigrationPlan(plan) {
     const results = [];
+
+    // Enable TiDB to allow removing AUTO_INCREMENT for this session
+    try {
+      await prisma.$executeRawUnsafe(`SET tidb_allow_remove_auto_inc = 1;`);
+    } catch (e) {
+      console.warn(`[Execution] Could not set tidb_allow_remove_auto_inc: ${e.message}`);
+    }
+
     for (const step of plan) {
       console.log(`[Execution] Processing ${step.type} on ${step.table}...`);
 
