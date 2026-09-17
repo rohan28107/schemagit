@@ -44,7 +44,7 @@ model Commit {
 
   isHead Boolean @default(false)
 
-  branchHead Branch? @relation("BranchHead")
+  branchHead Branch[] @relation("BranchHead")
 }
 
 model SchemaSnapshot {
