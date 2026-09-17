@@ -22,7 +22,7 @@ model Branch {
   project Project @relation(fields: [projectId], references: [id])
 
   head   Commit? @relation("BranchHead", fields: [headId], references: [id])
-  headId String? @unique
+  headId String?
 
   commits Commit[] @relation("BranchCommits")
 }

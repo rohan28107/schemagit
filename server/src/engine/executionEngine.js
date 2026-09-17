@@ -11,7 +11,9 @@ class ExecutionEngine {
     for (const step of plan) {
       console.log(`[Execution] Processing ${step.type} on ${step.table}...`);
 
-      if (step.risk === 'HIGH') {
+      // Use OSC for high-risk operations, BUT skip it for MODIFY_COLUMN
+      // because TiDB restricts AUTO_INCREMENT removal in shadow tables.
+      if (step.risk === 'HIGH' && step.type !== 'MODIFY_COLUMN') {
         const res = await this.runOSC(step);
         results.push({ step, status: 'SUCCESS', method: 'OSC', result: res });
       } else {
