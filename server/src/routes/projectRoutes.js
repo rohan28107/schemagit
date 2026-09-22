@@ -4,8 +4,12 @@ const { PrismaClient } = require("@prisma/client");
 const SQLParser = require("../engine/sqlParser");
 const SchemaEngine = require("../engine/schemaEngine");
 const ExecutionEngine = require("../engine/executionEngine");
+const ConnectionManager = require("../utils/connectionManager");
+const ConflictService = require("../services/ConflictService");
+const multer = require("multer");
 
 const prisma = new PrismaClient();
+const upload = multer();
 
 router.get("/health", (req, res) => {
   res.json({
@@ -15,13 +19,69 @@ router.get("/health", (req, res) => {
 });
 
 // Create a new project from a SQL dump
-router.post("/import", async (req, res) => {
+router.post("/import", upload.single("sqlFile"), async (req, res) => {
   try {
-    const { name, sql } = req.body;
+    const { name } = req.body;
+    let sql = req.body.sql;
+
+    if (req.file) {
+      sql = req.file.buffer.toString("utf8");
+    }
+
+    if (!sql) {
+      return res.status(400).json({
+        error:
+          "No SQL content provided. Please upload a .sql file or provide the sql string.",
+      });
+    }
+
+    // 1. Generate a unique database name for the project
+    const projectId = require('crypto').randomUUID();
+    const dbName = `schemagit_project_${projectId.substring(0, 8)}`;
+
+    // 2. Use Admin connection to create the physical database
+    const adminUrl = process.env.TIDB_ADMIN_URL;
+    if (!adminUrl) {
+      console.error('[Import] TIDB_ADMIN_URL is not configured');
+      return res.status(500).json({ error: "Server configuration error: Admin URL missing" });
+    }
+
+    const adminConn = await ConnectionManager.getConnection(adminUrl);
+    try {
+      await adminConn.execute(`CREATE DATABASE IF NOT EXISTS \`${dbName}\`;`);
+      console.log(`[Import] Provisioned database: ${dbName}`);
+    } finally {
+      await ConnectionManager.closeConnection(adminConn);
+    }
+
+    // 3. Build the project-specific connection string
+    const url = new URL(adminUrl);
+    const projectConnectionString = `${url.protocol}//${url.username}:${url.password}@${url.hostname}:${url.port}/${dbName}`;
+
+    // 4. Execute the imported SQL against the new database to initialize it
+    const projectConn = await ConnectionManager.getConnection(projectConnectionString);
+    try {
+      // We execute the raw SQL to create the initial tables
+      // Note: In a production environment, we'd split the SQL into statements
+      // For now, we assume the SQL is a valid dump.
+      await projectConn.query(sql);
+      console.log(`[Import] Initial schema executed for ${dbName}`);
+    } catch (e) {
+      console.error('[Import] SQL Execution failed:', e.message);
+      // We continue, but let the user know it might need 'Apply'
+    } finally {
+      await ConnectionManager.closeConnection(projectConn);
+    }
+
+    // 5. Create metadata in schemagit
     const snapshotContent = SQLParser.parse(sql);
 
     const project = await prisma.project.create({
-      data: { name },
+      data: {
+        id: projectId,
+        name,
+        connectionString: projectConnectionString,
+      },
     });
 
     const snapshot = await prisma.schemaSnapshot.create({
@@ -48,18 +108,16 @@ router.post("/import", async (req, res) => {
       data: { headId: initialCommit.id },
     });
 
-    // AUTO-APPLY: Sync the imported schema to the real DB immediately
-    const currentDbState = await SchemaEngine.getCurrentDbState(prisma);
-    const diff = SchemaEngine.diff(currentDbState, snapshotContent);
-    const plan = SchemaEngine.generateMigrationPlan(diff, snapshotContent);
-    await ExecutionEngine.executeMigrationPlan(plan);
-
     const projectWithBranches = await prisma.project.findUnique({
       where: { id: project.id },
       include: { branches: true },
     });
 
-    res.json({ project: projectWithBranches, branch: mainBranch });
+    res.json({
+      project: projectWithBranches,
+      branch: mainBranch,
+      provisionedDb: dbName
+    });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Failed to import schema" });
@@ -123,6 +181,30 @@ router.get("/diff", async (req, res) => {
   }
 });
 
+// Export a branch's schema to a .sql file
+router.get("/export", async (req, res) => {
+  const { branchId } = req.query;
+  try {
+    const branch = await prisma.branch.findUnique({
+      where: { id: branchId },
+      include: { head: { include: { snapshot: true } } },
+    });
+
+    if (!branch || !branch.head || !branch.head.snapshot) {
+      return res.status(404).json({ error: "Branch or snapshot not found" });
+    }
+
+    const snapshot = branch.head.snapshot.content;
+    const sql = SchemaEngine.generateFullSchemaSQL(snapshot);
+
+    res.attachment("schema_export.sql");
+    res.send(sql);
+  } catch (error) {
+    console.error("[Export] Critical error:", error);
+    res.status(500).json({ error: "Export failed", details: error.message });
+  }
+});
+
 // Get project details and current head
 router.get("/:id", async (req, res) => {
   try {
@@ -176,7 +258,10 @@ router.post("/branch", async (req, res) => {
 router.post("/commit", async (req, res) => {
   const { branchId, message, snapshot } = req.body;
   try {
-    const branch = await prisma.branch.findUnique({ where: { id: branchId } });
+    const branch = await prisma.branch.findUnique({
+      where: { id: branchId },
+      include: { project: true }
+    });
     const parentId = branch.headId;
 
     const parsedSnapshot = SQLParser.parse(snapshot);
@@ -197,12 +282,6 @@ router.post("/commit", async (req, res) => {
       where: { id: branchId },
       data: { headId: commit.id },
     });
-
-    // AUTO-SYNC: Apply the commit to the real DB immediately
-    const currentDbState = await SchemaEngine.getCurrentDbState(prisma);
-    const diff = SchemaEngine.diff(currentDbState, parsedSnapshot);
-    const plan = SchemaEngine.generateMigrationPlan(diff, parsedSnapshot);
-    await ExecutionEngine.executeMigrationPlan(plan);
 
     res.json(commit);
   } catch (error) {
@@ -237,12 +316,50 @@ router.post("/merge", async (req, res) => {
     const sourceSnapshot = sourceBranch.head.snapshot.content;
     const targetSnapshot = targetBranch.head.snapshot.content;
 
-    // In this simplified VCS, a merge takes the source branch's evolved state
-    // and applies it to the target branch.
+    // 1. Find Common Ancestor (LCA) for Three-Way Merge
+    let baseSnapshot = null;
+    const sourceCommits = await prisma.commit.findMany({
+      where: { branchId: sourceBranchId },
+      orderBy: { createdAt: 'desc' }
+    });
+    const targetCommits = await prisma.commit.findMany({
+      where: { branchId: targetBranchId },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const sourceCommitIds = new Set(sourceCommits.map(c => c.id));
+    for (const commit of targetCommits) {
+      if (sourceCommitIds.has(commit.id)) {
+        const ancestorSnapshot = await prisma.schemaSnapshot.findUnique({
+          where: { id: commit.snapshotId }
+        });
+        baseSnapshot = ancestorSnapshot?.content;
+        break;
+      }
+    }
+
+    // Fallback: if no common ancestor, base is empty
+    if (!baseSnapshot) baseSnapshot = {};
+
+    // 2. Use ConflictService for Three-Way Merge
+    const { mergedSchema, conflicts } = ConflictService.detectConflicts(
+      baseSnapshot,
+      sourceSnapshot,
+      targetSnapshot
+    );
+
     const mergeMessage = `Merged branch ${sourceBranch.name} into ${targetBranch.name}`;
 
+    if (conflicts.length > 0) {
+      return res.status(409).json({
+        error: "Merge conflicts detected",
+        conflicts,
+        mergedSnapshot: mergedSchema,
+      });
+    }
+
     const snapshotRecord = await prisma.schemaSnapshot.create({
-      data: { content: sourceSnapshot },
+      data: { content: mergedSchema },
     });
 
     const commit = await prisma.commit.create({
@@ -259,12 +376,6 @@ router.post("/merge", async (req, res) => {
       data: { headId: commit.id },
     });
 
-    // AUTO-SYNC: Apply the merged state to the real DB immediately
-    const currentDbState = await SchemaEngine.getCurrentDbState(prisma);
-    const diff = SchemaEngine.diff(currentDbState, sourceSnapshot);
-    const plan = SchemaEngine.generateMigrationPlan(diff, sourceSnapshot);
-    await ExecutionEngine.executeMigrationPlan(plan);
-
     res.json({
       message: `Successfully merged ${sourceBranch.name} into ${targetBranch.name}`,
       commit: commit,
@@ -275,13 +386,134 @@ router.post("/merge", async (req, res) => {
   }
 });
 
+// Resolve merge conflicts and finalize merge
+router.post("/resolve", async (req, res) => {
+  const { sourceBranchId, targetBranchId, resolutions } = req.body;
+  try {
+    const sourceBranch = await prisma.branch.findUnique({
+      where: { id: sourceBranchId },
+      include: { head: { include: { snapshot: true } } },
+    });
+    const targetBranch = await prisma.branch.findUnique({
+      where: { id: targetBranchId },
+      include: { head: { include: { snapshot: true } } },
+    });
+
+    if (!sourceBranch || !targetBranch) {
+      return res.status(404).json({ error: "One or both branches not found" });
+    }
+
+    const sourceSnapshot = sourceBranch.head.snapshot.content;
+    const targetSnapshot = targetBranch.head.snapshot.content;
+
+    // Re-calculate the merge to get the mergedSchema and conflicts
+    let baseSnapshot = null;
+    const sourceCommits = await prisma.commit.findMany({
+      where: { branchId: sourceBranchId },
+      orderBy: { createdAt: 'desc' }
+    });
+    const targetCommits = await prisma.commit.findMany({
+      where: { branchId: targetBranchId },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const sourceCommitIds = new Set(sourceCommits.map(c => c.id));
+    for (const commit of targetCommits) {
+      if (sourceCommitIds.has(commit.id)) {
+        const ancestorSnapshot = await prisma.schemaSnapshot.findUnique({
+          where: { id: commit.snapshotId }
+        });
+        baseSnapshot = ancestorSnapshot?.content;
+        break;
+      }
+    }
+    if (!baseSnapshot) baseSnapshot = {};
+
+    const { mergedSchema, conflicts } = ConflictService.detectConflicts(
+      baseSnapshot,
+      sourceSnapshot,
+      targetSnapshot
+    );
+
+    // Apply resolutions to the mergedSchema
+    const finalSchema = { ...mergedSchema };
+
+    if (Array.isArray(resolutions)) {
+      resolutions.forEach((resolution, index) => {
+        const conflict = conflicts[index];
+        if (!conflict) return;
+
+        if (conflict.type === 'TABLE_CONFLICT') {
+          finalSchema[conflict.table] = resolution;
+        } else if (conflict.type === 'COLUMN_CONFLICT') {
+          const table = conflict.table;
+          const colName = conflict.column;
+          if (finalSchema[table]) {
+            const updatedCols = finalSchema[table].columns.map(col =>
+              col.name.toLowerCase() === colName.toLowerCase() ? resolution : col
+            );
+            finalSchema[table] = { ...finalSchema[table], columns: updatedCols };
+          }
+        }
+      });
+    } else if (resolutions && typeof resolutions === 'object') {
+      Object.entries(resolutions).forEach(([index, resolution]) => {
+        const conflict = conflicts[parseInt(index)];
+        if (!conflict) return;
+
+        if (conflict.type === 'TABLE_CONFLICT') {
+          finalSchema[conflict.table] = resolution;
+        } else if (conflict.type === 'COLUMN_CONFLICT') {
+          const table = conflict.table;
+          const colName = conflict.column;
+          if (finalSchema[table]) {
+            const updatedCols = finalSchema[table].columns.map(col =>
+              col.name.toLowerCase() === colName.toLowerCase() ? resolution : col
+            );
+            finalSchema[table] = { ...finalSchema[table], columns: updatedCols };
+          }
+        }
+      });
+    }
+
+    const snapshotRecord = await prisma.schemaSnapshot.create({
+      data: { content: finalSchema },
+    });
+
+    const commit = await prisma.commit.create({
+      data: {
+        message: `Resolved merge conflicts from ${sourceBranch.name} into ${targetBranch.name}`,
+        snapshotId: snapshotRecord.id,
+        branchId: targetBranchId,
+        parentId: targetBranch.headId,
+      },
+    });
+
+    await prisma.branch.update({
+      where: { id: targetBranchId },
+      data: { headId: commit.id },
+    });
+
+    res.json({
+      message: "Conflicts resolved and merged successfully",
+      commit: commit,
+    });
+  } catch (error) {
+    console.error("[Resolve] Critical error:", error);
+    res.status(500).json({ error: "Failed to resolve conflicts", details: error.message });
+  }
+});
+
 // Apply changes to the real database
 router.post("/apply", async (req, res) => {
   const { branchId } = req.body;
   try {
     const branch = await prisma.branch.findUnique({
       where: { id: branchId },
-      include: { head: { include: { snapshot: true } } },
+      include: {
+        head: { include: { snapshot: true } },
+        project: true
+      },
     });
 
     if (!branch || !branch.head || !branch.head.snapshot) {
@@ -290,31 +522,49 @@ router.post("/apply", async (req, res) => {
 
     console.log(`[Apply] Applying branch ${branchId} to database...`);
 
-    // 1. Get actual current DB state
-    const currentDbState = await SchemaEngine.getCurrentDbState(prisma);
+    const targetDb = await ConnectionManager.getConnection(branch.project.connectionString);
+    try {
+      // 1. Get actual current DB state
+      const currentDbState = await SchemaEngine.getCurrentDbState(targetDb);
 
-    // 2. Generate a structured migration plan
-    const diff = SchemaEngine.diff(
-      currentDbState,
-      branch.head.snapshot.content,
-    );
-    const plan = SchemaEngine.generateMigrationPlan(
-      diff,
-      branch.head.snapshot.content,
-    );
+      // 2. Generate a structured migration plan
+      const diff = SchemaEngine.diff(
+        currentDbState,
+        branch.head.snapshot.content,
+      );
+      const plan = SchemaEngine.generateMigrationPlan(
+        diff,
+        branch.head.snapshot.content,
+      );
 
-    if (plan.length === 0) {
-      return res.json({ message: "Database is already up to date", plan: [] });
+      if (plan.length === 0) {
+        return res.json({ message: "Database is already up to date", plan: [] });
+      }
+
+      // 3. Execute the migration plan (handling large tables automatically)
+      const results = await ExecutionEngine.executeMigrationPlan(plan, targetDb);
+
+      // 4. VERIFY: Compare real DB state after migration with the target snapshot
+      const postMigrationState = await SchemaEngine.getCurrentDbState(targetDb);
+      const verification = SchemaEngine.verify(postMigrationState, branch.head.snapshot.content);
+
+      if (!verification.isVerified) {
+        console.error("[Apply] Verification failed. Full Diff:", JSON.stringify(verification.diff, null, 2));
+        return res.status(500).json({
+          error: "Verification failed",
+          message: "The database was updated, but the resulting state does not match the commit snapshot.",
+          diff: verification.diff
+        });
+      }
+
+      res.json({
+        message: "Schema applied and verified successfully",
+        appliedSteps: results.length,
+        details: results,
+      });
+    } finally {
+      await ConnectionManager.closeConnection(targetDb);
     }
-
-    // 3. Execute the migration plan (handling large tables automatically)
-    const results = await ExecutionEngine.executeMigrationPlan(plan);
-
-    res.json({
-      message: "Schema applied successfully",
-      appliedSteps: results.length,
-      details: results,
-    });
   } catch (error) {
     console.error("[Apply] Critical error:", error);
     res
