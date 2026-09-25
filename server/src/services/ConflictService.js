@@ -99,8 +99,8 @@ class ConflictService {
         const cA = colsA.find(c => c.name.toLowerCase() === colNameLower);
         const cB = colsB.find(c => c.name.toLowerCase() === colNameLower);
 
-        const isAChanged = !cBase || !cA || !SchemaEngine.isColumnSemanticallyEqual(cBase, cA);
-        const isBChanged = !cBase || !cB || !SchemaEngine.isColumnSemanticallyEqual(cBase, cB);
+        const isAChanged = !cBase || !cA || JSON.stringify(cBase) !== JSON.stringify(cA);
+        const isBChanged = !cBase || !cB || JSON.stringify(cBase) !== JSON.stringify(cB);
 
         if (!isAChanged && !isBChanged) {
           if (cA) mergedColumns.push(cA);
@@ -109,9 +109,11 @@ class ConflictService {
         } else if (isAChanged && !isBChanged) {
           if (cA) mergedColumns.push(cA);
         } else {
+          // Both changed - check if they changed to the same thing
           if (cA && cB && SchemaEngine.isColumnSemanticallyEqual(cA, cB)) {
              mergedColumns.push(cA);
           } else {
+            // Actual conflict
             if (cA && cB) {
               conflicts.push({
                 type: 'COLUMN_CONFLICT',

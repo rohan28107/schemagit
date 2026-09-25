@@ -571,15 +571,35 @@ router.post("/apply", async (req, res) => {
       return res.status(404).json({ error: "Branch or snapshot not found" });
     }
 
+    // --- CONCURRENCY LOCK ---
+    const project = branch.project;
+    if (project.status !== 'READY') {
+      return res.status(409).json({
+        error: "Concurrency Conflict",
+        message: "Another schema migration is currently running for this project."
+      });
+    }
+
+    try {
+      await prisma.project.update({
+        where: { id: project.id },
+        data: { status: 'VERIFYING' },
+      });
+    } catch (e) {
+      // Handle case where another request just snatched the lock
+      return res.status(409).json({
+        error: "Concurrency Conflict",
+        message: "Another schema migration is currently running for this project."
+      });
+    }
+    // -------------------------
+
     console.log(`[Apply] Applying branch ${branchId} to database...`);
 
-    await prisma.project.update({
-      where: { id: branch.project.id },
-      data: { status: 'VERIFYING' },
-    });
-
-    const targetDb = await ConnectionManager.getConnection(branch.project.connectionString);
+    let targetDb;
     try {
+      targetDb = await ConnectionManager.getConnection(project.connectionString);
+
       // 1. Get actual current DB state
       const currentDbState = await SchemaEngine.getCurrentDbState(targetDb);
 
@@ -595,7 +615,7 @@ router.post("/apply", async (req, res) => {
 
       if (plan.length === 0) {
         await prisma.project.update({
-          where: { id: branch.project.id },
+          where: { id: project.id },
           data: { status: 'READY' },
         });
         return res.json({ message: "Database is already up to date", plan: [] });
@@ -610,11 +630,7 @@ router.post("/apply", async (req, res) => {
 
       if (!verification.isVerified) {
         console.error("[Apply] Verification failed. Full Diff:", JSON.stringify(verification.diff, null, 2));
-        return res.status(500).json({
-          error: "Verification failed",
-          message: "The database was updated, but the resulting state does not match the commit snapshot.",
-          diff: verification.diff
-        });
+        throw new Error(`Verification failed: The database was updated, but the resulting state does not match the commit snapshot.`);
       }
 
       res.json({
@@ -623,15 +639,35 @@ router.post("/apply", async (req, res) => {
         details: results,
       });
 
+    } finally {
+      if (targetDb) {
+        await ConnectionManager.closeConnection(targetDb);
+      }
+      // Always reset status
       await prisma.project.update({
-        where: { id: branch.project.id },
+        where: { id: project.id },
         data: { status: 'READY' },
       });
-    } finally {
-      await ConnectionManager.closeConnection(targetDb);
     }
   } catch (error) {
     console.error("[Apply] Critical error:", error);
+
+    // Try to reset project status to READY or FAILED on error
+    try {
+      const branch = await prisma.branch.findUnique({
+        where: { id: branchId },
+        include: { project: true }
+      });
+      if (branch?.project) {
+        await prisma.project.update({
+          where: { id: branch.project.id },
+          data: { status: 'FAILED' },
+        });
+      }
+    } catch (resetError) {
+      console.error("[Apply] Failed to reset project status:", resetError.message);
+    }
+
     res
       .status(500)
       .json({ error: "Failed to apply schema", details: error.message });

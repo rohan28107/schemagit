@@ -8,6 +8,7 @@ class ExecutionEngine {
    */
   static async executeMigrationPlan(plan, dbClient) {
     const results = [];
+    const { safeIdentifier } = require('../utils/sqlUtils');
 
     try {
       await dbClient.execute(`SET tidb_allow_remove_auto_inc = 1;`);
@@ -18,7 +19,7 @@ class ExecutionEngine {
     for (const step of plan) {
       console.log(`[Execution] Processing ${step.type} on ${step.table}...`);
 
-      if (step.type === 'RENAME_TABLE') {
+      if (step.type === 'RENAME_TABLE' || step.type === 'RENAME_COLUMN') {
         const res = await this.runStandardDDL(step.sql, dbClient);
         results.push({ step, status: 'SUCCESS', method: 'STANDARD', result: res });
         continue;
@@ -128,21 +129,22 @@ class ExecutionEngine {
    */
   static async runOSC(step, dbClient) {
     const { table, sql } = step;
+    const { safeIdentifier } = require('../utils/sqlUtils');
     console.log(`[OSC] Starting Online Schema Change for ${table} to avoid locks...`);
 
     const shadowTableName = `${table}_shadow`;
     console.log(`[OSC] Creating shadow table ${shadowTableName}...`);
 
-    await dbClient.execute(`CREATE TABLE \`${shadowTableName}\` LIKE \`${table}\`;`);
+    await dbClient.execute(`CREATE TABLE ${safeIdentifier(shadowTableName)} LIKE ${safeIdentifier(table)};`);
 
-    const shadowSql = sql.replace(new RegExp(`\`${table}\``, 'g'), `\`${shadowTableName}\``);
+    const shadowSql = sql.replace(new RegExp(`\`${table}\``, 'g'), safeIdentifier(shadowTableName));
     await dbClient.execute(shadowSql);
 
     console.log(`[OSC] Copying data in chunks using PK range...`);
 
     const [pkResult] = await dbClient.execute(
       `SELECT column_name FROM information_schema.columns
-       WHERE table_name = '${table}' AND column_key = 'PRI' LIMIT 1`
+       WHERE table_name = ${safeIdentifier(table)} AND column_key = 'PRI' LIMIT 1`
     );
     const pkColumn = pkResult[0]?.COLUMN_NAME || 'id';
     console.log(`[OSC] Using primary key \`${pkColumn}\` for chunking`);
@@ -153,8 +155,8 @@ class ExecutionEngine {
 
     while (true) {
       const query = lastId
-        ? `INSERT INTO \`${shadowTableName}\` SELECT * FROM \`${table}\` WHERE \`${pkColumn}\` > ${lastId} ORDER BY \`${pkColumn}\` ASC LIMIT ${CHUNK_SIZE}`
-        : `INSERT INTO \`${shadowTableName}\` SELECT * FROM \`${table}\` ORDER BY \`${pkColumn}\` ASC LIMIT ${CHUNK_SIZE}`;
+        ? `INSERT INTO ${safeIdentifier(shadowTableName)} SELECT * FROM ${safeIdentifier(table)} WHERE ${safeIdentifier(pkColumn)} > ${lastId} ORDER BY ${safeIdentifier(pkColumn)} ASC LIMIT ${CHUNK_SIZE}`
+        : `INSERT INTO ${safeIdentifier(shadowTableName)} SELECT * FROM ${safeIdentifier(table)} ORDER BY ${safeIdentifier(pkColumn)} ASC LIMIT ${CHUNK_SIZE}`;
 
       const [result] = await dbClient.execute(query);
       const count = result.affectedRows;
@@ -164,7 +166,7 @@ class ExecutionEngine {
       totalCopied += count;
 
       const [lastIdResult] = await dbClient.execute(
-        `SELECT \`${pkColumn}\` FROM \`${shadowTableName}\` ORDER BY \`${pkColumn}\` DESC LIMIT 1`
+        `SELECT ${safeIdentifier(pkColumn)} FROM ${safeIdentifier(shadowTableName)} ORDER BY ${safeIdentifier(pkColumn)} DESC LIMIT 1`
       );
       lastId = lastIdResult[0] ? lastIdResult[0][pkColumn] : null;
 
@@ -173,18 +175,19 @@ class ExecutionEngine {
     }
 
     console.log(`[OSC] Swapping tables...`);
-    await dbClient.execute(`RENAME TABLE \`${table}\` TO \`${table}_old\`, \`${shadowTableName}\` TO \`${table}\`;`);
+    await dbClient.execute(`RENAME TABLE ${safeIdentifier(table)} TO ${safeIdentifier(table + '_old')}, ${safeIdentifier(shadowTableName)} TO ${safeIdentifier(table)};`);
 
     console.log(`[OSC] Cleaning up...`);
-    await dbClient.execute(`DROP TABLE \`${table}_old\`;`);
+    await dbClient.execute(`DROP TABLE ${safeIdentifier(table + '_old')};`);
 
     return { rowsCopied: totalCopied };
   }
 
   static async getTableInfo(tableName) {
+    const { safeIdentifier } = require('../utils/sqlUtils');
     // Query INFORMATION_SCHEMA to get data length
     const result = await prisma.$queryRawUnsafe(
-      `SELECT data_length FROM information_schema.tables WHERE table_name = '${tableName}' AND table_schema = DATABASE()`
+      `SELECT data_length FROM information_schema.tables WHERE table_name = ${safeIdentifier(tableName)} AND table_schema = DATABASE()`
     );
     return result[0] || { data_length: 0 };
   }
