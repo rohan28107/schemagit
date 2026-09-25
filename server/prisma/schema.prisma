@@ -8,10 +8,12 @@ datasource db {
 }
 
 model Project {
-  id        String   @id @default(uuid())
-  name      String
-  createdAt DateTime @default(now())
-  branches  Branch[]
+  id               String   @id @default(uuid())
+  name             String
+  connectionString String?  // Connection string for the target database
+  status           String   @default("READY") // PROVISIONING, IMPORTING, VERIFYING, READY, FAILED
+  createdAt        DateTime @default(now())
+  branches         Branch[]
 }
 
 model Branch {

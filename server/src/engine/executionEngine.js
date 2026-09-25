@@ -1,17 +1,16 @@
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
+const mysql = require('mysql2/promise');
 
 class ExecutionEngine {
   /**
    * Executes a structured migration plan.
    * @param {Array} plan - The migration plan from SchemaEngine.
+   * @param {Object} dbClient - A mysql2 connection.
    */
-  static async executeMigrationPlan(plan) {
+  static async executeMigrationPlan(plan, dbClient) {
     const results = [];
 
-    // Enable TiDB to allow removing AUTO_INCREMENT for this session
     try {
-      await prisma.$executeRawUnsafe(`SET tidb_allow_remove_auto_inc = 1;`);
+      await dbClient.execute(`SET tidb_allow_remove_auto_inc = 1;`);
     } catch (e) {
       console.warn(`[Execution] Could not set tidb_allow_remove_auto_inc: ${e.message}`);
     }
@@ -19,19 +18,38 @@ class ExecutionEngine {
     for (const step of plan) {
       console.log(`[Execution] Processing ${step.type} on ${step.table}...`);
 
-      // Use OSC for high-risk operations, BUT skip it for MODIFY_COLUMN
-      // because TiDB restricts AUTO_INCREMENT removal in shadow tables.
-      if (step.risk === 'HIGH' && step.type !== 'MODIFY_COLUMN') {
-        const res = await this.runOSC(step);
+      if (step.type === 'RENAME_TABLE') {
+        const res = await this.runStandardDDL(step.sql, dbClient);
+        results.push({ step, status: 'SUCCESS', method: 'STANDARD', result: res });
+        continue;
+      }
+
+      if (step.risk === 'HIGH') {
+        const res = await this.runOSC(step, dbClient);
         results.push({ step, status: 'SUCCESS', method: 'OSC', result: res });
       } else {
-        const res = await this.runStandardDDL(step.sql);
+        let res;
+        try {
+          res = await this.runStandardDDL(step.sql, dbClient);
+        } catch (e) {
+          if (step.type === 'CREATE_TABLE' && (e.message.includes('already exists') || e.errno === 1050)) {
+            console.log(`[Execution] Table \`${step.table}\` already exists (caught error). Synchronizing columns...`);
+            const syncResults = await this.syncColumnsForExistingTable(step.table, step.columns, dbClient);
+            results.push({
+              step,
+              status: 'SUCCESS',
+              method: 'STANDARD_WITH_SYNC',
+              result: null,
+              syncDetails: syncResults
+            });
+            continue;
+          }
+          throw e;
+        }
 
-        // FALLBACK: If CREATE_TABLE returned 0, the table already exists.
-        // We must now synchronize its columns to ensure the schema matches.
-        if (step.type === 'CREATE_TABLE' && res === 0 && step.columns) {
+        if (step.type === 'CREATE_TABLE' && res[0] && res[0].affectedRows === 0 && step.columns) {
           console.log(`[Execution] Table \`${step.table}\` already exists. Synchronizing columns...`);
-          const syncResults = await this.syncColumnsForExistingTable(step.table, step.columns);
+          const syncResults = await this.syncColumnsForExistingTable(step.table, step.columns, dbClient);
           results.push({
             step,
             status: 'SUCCESS',
@@ -45,29 +63,27 @@ class ExecutionEngine {
         results.push({ step, status: 'SUCCESS', method: 'STANDARD', result: res });
       }
     }
+
     return results;
   }
 
   /**
    * Ensures an existing table has all the columns defined in the target schema.
-   * This prevents the "result: 0" issue where CREATE TABLE IF NOT EXISTS does nothing.
    */
-  static async syncColumnsForExistingTable(tableName, targetColumns) {
+  static async syncColumnsForExistingTable(tableName, targetColumns, dbClient) {
     const syncResults = [];
 
-    // 1. Get actual current columns for this specific table
-    const dbNameResult = await prisma.$queryRawUnsafe(`SELECT DATABASE() as db`);
+    const [dbNameResult] = await dbClient.execute(`SELECT DATABASE() as db`);
     const currentDb = dbNameResult[0]?.db;
 
-    const currentCols = await prisma.$queryRawUnsafe(
+    const [currentCols] = await dbClient.execute(
       `SELECT column_name as name
        FROM information_schema.columns
        WHERE table_name = '${tableName}' AND table_schema = ${currentDb ? `\'${currentDb}\'` : 'NULL'}`
     );
 
-    const existingColNames = currentCols.map(c => c.name.toLowerCase());
+    const existingColNames = currentCols.map(c => (c.COLUMN_NAME || c.name || '').toLowerCase());
 
-    // 2. Add missing columns
     for (const col of targetColumns) {
       if (!existingColNames.includes(col.name.toLowerCase())) {
         console.log(`[Sync] Adding missing column \`${col.name}\` to \`${tableName}\`...`);
@@ -76,7 +92,7 @@ class ExecutionEngine {
         const sql = `ALTER TABLE \`${tableName}\` ADD COLUMN \`${col.name}\` ${col.type} ${nullSql} ${defaultSql};`;
 
         try {
-          await prisma.$executeRawUnsafe(sql);
+          await dbClient.execute(sql);
           syncResults.push({ column: col.name, action: 'ADDED' });
         } catch (e) {
           console.error(`[Sync] Failed to add column ${col.name}:`, e.message);
@@ -85,17 +101,16 @@ class ExecutionEngine {
       }
     }
 
-    // 3. Drop obsolete columns (The missing piece!)
-    // We only drop columns that are present in the DB but NOT in our target schema
     const targetColNames = targetColumns.map(c => c.name.toLowerCase());
     for (const existingCol of currentCols) {
-      const colName = existingCol.name;
-      if (!targetColNames.includes(colName.toLowerCase())) {
+      const colName = existingCol.COLUMN_NAME || existingCol.name;
+      if (colName && !targetColNames.includes(colName.toLowerCase())) {
         console.log(`[Sync] Dropping obsolete column \`${colName}\` from \`${tableName}\`...`);
         const sql = `ALTER TABLE \`${tableName}\` DROP COLUMN \`${colName}\`;`;
+;
 
         try {
-          await prisma.$executeRawUnsafe(sql);
+          await dbClient.execute(sql);
           syncResults.push({ column: colName, action: 'DROPPED' });
         } catch (e) {
           console.error(`[Sync] Failed to drop column ${colName}:`, e.message);
@@ -109,50 +124,59 @@ class ExecutionEngine {
 
   /**
    * Implements a simulated Online Schema Change (OSC) pattern for large tables.
-   * For a real production app, this would use a tool like gh-ost or pt-osc.
+   * Optimized for large tables by avoiding OFFSET.
    */
-  static async runOSC(step) {
+  static async runOSC(step, dbClient) {
     const { table, sql } = step;
     console.log(`[OSC] Starting Online Schema Change for ${table} to avoid locks...`);
 
-    // 1. Create Shadow Table
     const shadowTableName = `${table}_shadow`;
     console.log(`[OSC] Creating shadow table ${shadowTableName}...`);
 
-    // Corrected: Use a more reliable way to clone table structure
-    await prisma.$executeRawUnsafe(`CREATE TABLE \`${shadowTableName}\` LIKE \`${table}\`;`);
+    await dbClient.execute(`CREATE TABLE \`${shadowTableName}\` LIKE \`${table}\`;`);
 
-    // Apply the change to the shadow table
-    // Ensure we target the shadow table in the SQL statement
     const shadowSql = sql.replace(new RegExp(`\`${table}\``, 'g'), `\`${shadowTableName}\``);
-    await prisma.$executeRawUnsafe(shadowSql);
+    await dbClient.execute(shadowSql);
 
-    // 2. Chunked Data Copy
-    console.log(`[OSC] Copying data in chunks...`);
-    let offset = 0;
-    const CHUNK_SIZE = 1000;
+    console.log(`[OSC] Copying data in chunks using PK range...`);
+
+    const [pkResult] = await dbClient.execute(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_name = '${table}' AND column_key = 'PRI' LIMIT 1`
+    );
+    const pkColumn = pkResult[0]?.COLUMN_NAME || 'id';
+    console.log(`[OSC] Using primary key \`${pkColumn}\` for chunking`);
+
+    let lastId = null;
+    const CHUNK_SIZE = 5000;
     let totalCopied = 0;
 
     while (true) {
-      const count = await prisma.$executeRawUnsafe(
-        `INSERT INTO \`${shadowTableName}\` SELECT * FROM \`${table}\` LIMIT ${CHUNK_SIZE} OFFSET ${offset}`
-      );
+      const query = lastId
+        ? `INSERT INTO \`${shadowTableName}\` SELECT * FROM \`${table}\` WHERE \`${pkColumn}\` > ${lastId} ORDER BY \`${pkColumn}\` ASC LIMIT ${CHUNK_SIZE}`
+        : `INSERT INTO \`${shadowTableName}\` SELECT * FROM \`${table}\` ORDER BY \`${pkColumn}\` ASC LIMIT ${CHUNK_SIZE}`;
+
+      const [result] = await dbClient.execute(query);
+      const count = result.affectedRows;
 
       if (count === 0) break;
 
       totalCopied += count;
-      offset += CHUNK_SIZE;
-      console.log(`[OSC] Copied ${totalCopied} rows...`);
 
+      const [lastIdResult] = await dbClient.execute(
+        `SELECT \`${pkColumn}\` FROM \`${shadowTableName}\` ORDER BY \`${pkColumn}\` DESC LIMIT 1`
+      );
+      lastId = lastIdResult[0] ? lastIdResult[0][pkColumn] : null;
+
+      console.log(`[OSC] Copied ${totalCopied} rows...`);
       await new Promise(resolve => setTimeout(resolve, 10));
     }
 
-    // 3. Atomic Swap
     console.log(`[OSC] Swapping tables...`);
-    await prisma.$executeRawUnsafe(`RENAME TABLE \`${table}\` TO \`${table}_old\`, \`${shadowTableName}\` TO \`${table}\`;`);
+    await dbClient.execute(`RENAME TABLE \`${table}\` TO \`${table}_old\`, \`${shadowTableName}\` TO \`${table}\`;`);
 
-    // 4. Cleanup
-    await prisma.$executeRawUnsafe(`DROP TABLE \`${table}_old\`;`);
+    console.log(`[OSC] Cleaning up...`);
+    await dbClient.execute(`DROP TABLE \`${table}_old\`;`);
 
     return { rowsCopied: totalCopied };
   }
@@ -178,9 +202,9 @@ class ExecutionEngine {
     return prisma.$executeRawUnsafe(instantSql);
   }
 
-  static async runStandardDDL(sql) {
+  static async runStandardDDL(sql, dbClient) {
     console.log(`[SQL Execution] Running: ${sql}`);
-    return prisma.$executeRawUnsafe(sql);
+    return dbClient.execute(sql);
   }
 }
 

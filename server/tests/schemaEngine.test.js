@@ -1,4 +1,5 @@
 const SchemaEngine = require('../src/engine/schemaEngine');
+const ConflictService = require('../src/services/ConflictService');
 
 describe('SchemaEngine', () => {
   const mockOldSchema = {
@@ -138,6 +139,40 @@ describe('SchemaEngine', () => {
       };
       const plan = SchemaEngine.generateMigrationPlan(diff);
       expect(plan[0].sql).toContain('ALTER TABLE `users` DROP COLUMN `email`');
+    });
+  });
+
+  describe('ConflictService Edge Cases', () => {
+    test('should detect a TABLE_CONFLICT when both branches create same table with different structures', () => {
+      const base = {};
+      const branchA = {
+        logs: { columns: [{ name: 'id', type: 'INT', nullable: false }] }
+      };
+      const branchB = {
+        logs: { columns: [{ name: 'id', type: 'INT', nullable: false, primaryKey: true }] }
+      };
+
+      const { conflicts } = ConflictService.detectConflicts(base, branchA, branchB);
+      expect(conflicts).toContainEqual(
+        expect.objectContaining({ type: 'TABLE_CONFLICT', table: 'logs' })
+      );
+    });
+
+    test('should detect a COLUMN_CONFLICT when both branches modify same column differently', () => {
+      const base = {
+        users: { columns: [{ name: 'username', type: 'TEXT', nullable: false }] }
+      };
+      const branchA = {
+        users: { columns: [{ name: 'username', type: 'INT', nullable: false }] }
+      };
+      const branchB = {
+        users: { columns: [{ name: 'username', type: 'VARCHAR', nullable: false }] }
+      };
+
+      const { conflicts } = ConflictService.detectConflicts(base, branchA, branchB);
+      expect(conflicts).toContainEqual(
+        expect.objectContaining({ type: 'COLUMN_CONFLICT', column: 'username' })
+      );
     });
   });
 });

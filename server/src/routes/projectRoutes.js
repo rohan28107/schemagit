@@ -46,6 +46,20 @@ router.post("/import", upload.single("sqlFile"), async (req, res) => {
       return res.status(500).json({ error: "Server configuration error: Admin URL missing" });
     }
 
+    // 3. Build the project-specific connection string
+    const url = new URL(adminUrl);
+    const projectConnectionString = `${url.protocol}//${url.username}:${url.password}@${url.hostname}:${url.port}/${dbName}`;
+
+    // Provision project record first to track status
+    const project = await prisma.project.create({
+      data: {
+        id: projectId,
+        name,
+        connectionString: projectConnectionString,
+        status: 'PROVISIONING',
+      },
+    });
+
     const adminConn = await ConnectionManager.getConnection(adminUrl);
     try {
       await adminConn.execute(`CREATE DATABASE IF NOT EXISTS \`${dbName}\`;`);
@@ -54,9 +68,12 @@ router.post("/import", upload.single("sqlFile"), async (req, res) => {
       await ConnectionManager.closeConnection(adminConn);
     }
 
-    // 3. Build the project-specific connection string
-    const url = new URL(adminUrl);
-    const projectConnectionString = `${url.protocol}//${url.username}:${url.password}@${url.hostname}:${url.port}/${dbName}`;
+
+    // Update status to IMPORTING
+    await prisma.project.update({
+      where: { id: projectId },
+      data: { status: 'IMPORTING' },
+    });
 
     // 4. Execute the imported SQL against the new database to initialize it
     const projectConn = await ConnectionManager.getConnection(projectConnectionString);
@@ -73,16 +90,28 @@ router.post("/import", upload.single("sqlFile"), async (req, res) => {
       await ConnectionManager.closeConnection(projectConn);
     }
 
-    // 5. Create metadata in schemagit
-    const snapshotContent = SQLParser.parse(sql);
-
-    const project = await prisma.project.create({
-      data: {
-        id: projectId,
-        name,
-        connectionString: projectConnectionString,
-      },
+    // Update status to VERIFYING
+    await prisma.project.update({
+      where: { id: projectId },
+      data: { status: 'VERIFYING' },
     });
+
+    // 5. Verify the physical state against the metadata
+    const verifyConn = await ConnectionManager.getConnection(projectConnectionString);
+    try {
+      const currentState = await SchemaEngine.getCurrentDbState(verifyConn);
+      const snapshotContent = SQLParser.parse(sql);
+      const verification = SchemaEngine.verify(currentState, snapshotContent);
+
+      if (!verification.isVerified) {
+        console.warn(`[Import] Verification mismatch detected: ${JSON.stringify(verification.diff)}`);
+      }
+    } finally {
+      await ConnectionManager.closeConnection(verifyConn);
+    }
+
+    // 6. Create metadata in schemagit
+    const snapshotContent = SQLParser.parse(sql);
 
     const snapshot = await prisma.schemaSnapshot.create({
       data: { content: snapshotContent },
@@ -108,6 +137,12 @@ router.post("/import", upload.single("sqlFile"), async (req, res) => {
       data: { headId: initialCommit.id },
     });
 
+    // Final status: READY
+    await prisma.project.update({
+      where: { id: projectId },
+      data: { status: 'READY' },
+    });
+
     const projectWithBranches = await prisma.project.findUnique({
       where: { id: project.id },
       include: { branches: true },
@@ -119,12 +154,25 @@ router.post("/import", upload.single("sqlFile"), async (req, res) => {
       provisionedDb: dbName
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Failed to import schema" });
+    console.error('[Import Error] Detailed:', error);
+
+    // Mark project as FAILED if it was created
+    try {
+      await prisma.project.update({
+        where: { id: projectId },
+        data: { status: 'FAILED' },
+      });
+    } catch (e) {
+      // project might not have been created yet
+    }
+
+    res.status(500).json({ error: "Failed to import schema", details: error.message });
   }
+
 });
 
 // Diff two branches
+
 router.get("/diff", async (req, res) => {
   const { branchA, branchB } = req.query;
   console.log(
@@ -264,7 +312,10 @@ router.post("/commit", async (req, res) => {
     });
     const parentId = branch.headId;
 
-    const parsedSnapshot = SQLParser.parse(snapshot);
+    // Handle both raw SQL strings and pre-parsed snapshot objects
+    const parsedSnapshot = typeof snapshot === 'string'
+      ? SQLParser.parse(snapshot)
+      : snapshot;
     const snapshotRecord = await prisma.schemaSnapshot.create({
       data: { content: parsedSnapshot },
     });
@@ -522,6 +573,11 @@ router.post("/apply", async (req, res) => {
 
     console.log(`[Apply] Applying branch ${branchId} to database...`);
 
+    await prisma.project.update({
+      where: { id: branch.project.id },
+      data: { status: 'VERIFYING' },
+    });
+
     const targetDb = await ConnectionManager.getConnection(branch.project.connectionString);
     try {
       // 1. Get actual current DB state
@@ -538,6 +594,10 @@ router.post("/apply", async (req, res) => {
       );
 
       if (plan.length === 0) {
+        await prisma.project.update({
+          where: { id: branch.project.id },
+          data: { status: 'READY' },
+        });
         return res.json({ message: "Database is already up to date", plan: [] });
       }
 
@@ -561,6 +621,11 @@ router.post("/apply", async (req, res) => {
         message: "Schema applied and verified successfully",
         appliedSteps: results.length,
         details: results,
+      });
+
+      await prisma.project.update({
+        where: { id: branch.project.id },
+        data: { status: 'READY' },
       });
     } finally {
       await ConnectionManager.closeConnection(targetDb);
