@@ -1,0 +1,1294 @@
+const express = require("express");
+const router = express.Router();
+const { PrismaClient } = require("@prisma/client");
+const SQLParser = require("../engine/sqlParser");
+const SchemaEngine = require("../engine/schemaEngine");
+const ExecutionEngine = require("../engine/executionEngine");
+const ConnectionManager = require("../utils/connectionManager");
+const ConflictService = require("../services/ConflictService");
+const multer = require("multer");
+
+const prisma = new PrismaClient();
+const upload = multer();
+
+router.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    message: "SchemaGit API is running",
+  });
+});
+
+// Create a new project from a SQL dump
+router.post("/import", upload.single("sqlFile"), async (req, res) => {
+  try {
+    const { name } = req.body;
+    let sql = req.body.sql;
+
+    if (req.file) {
+      sql = req.file.buffer.toString("utf8");
+    }
+
+    if (!sql) {
+      return res.status(400).json({
+        error:
+          "No SQL content provided. Please upload a .sql file or provide the sql string.",
+      });
+    }
+
+    // 1. Generate a unique database name for the project
+    const projectId = require('crypto').randomUUID();
+    const dbName = `schemagit_project_${projectId.substring(0, 8)}`;
+
+    // 2. Use Admin connection to create the physical database
+    const adminUrl = process.env.TIDB_ADMIN_URL;
+    if (!adminUrl) {
+      console.error('[Import] TIDB_ADMIN_URL is not configured');
+      return res.status(500).json({ error: "Server configuration error: Admin URL missing" });
+    }
+
+    // 3. Build the project-specific connection string
+    const url = new URL(adminUrl);
+    const projectConnectionString = `${url.protocol}//${url.username}:${url.password}@${url.hostname}:${url.port}/${dbName}`;
+
+    // Provision project record first to track status
+    const project = await prisma.project.create({
+      data: {
+        id: projectId,
+        name,
+        connectionString: projectConnectionString,
+        status: 'PROVISIONING',
+      },
+    });
+
+    const adminConn = await ConnectionManager.getConnection(adminUrl);
+    try {
+      await adminConn.execute(`CREATE DATABASE IF NOT EXISTS \`${dbName}\`;`);
+      console.log(`[Import] Provisioned database: ${dbName}`);
+    } finally {
+      await ConnectionManager.closeConnection(adminConn);
+    }
+
+
+    // Update status to IMPORTING
+    await prisma.project.update({
+      where: { id: projectId },
+      data: { status: 'IMPORTING' },
+    });
+
+    // 4. Execute the imported SQL against the new database to initialize it
+    const projectConn = await ConnectionManager.getConnection(projectConnectionString);
+    try {
+      // We execute the raw SQL to create the initial tables
+      // Note: In a production environment, we'd split the SQL into statements
+      // For now, we assume the SQL is a valid dump.
+      await projectConn.query(sql);
+      console.log(`[Import] Initial schema executed for ${dbName}`);
+    } catch (e) {
+      console.error('[Import] SQL Execution failed:', e.message);
+      // We continue, but let the user know it might need 'Apply'
+    } finally {
+      await ConnectionManager.closeConnection(projectConn);
+    }
+
+    // Update status to VERIFYING
+    await prisma.project.update({
+      where: { id: projectId },
+      data: { status: 'VERIFYING' },
+    });
+
+    // 5. Verify the physical state against the metadata
+    const verifyConn = await ConnectionManager.getConnection(projectConnectionString);
+    try {
+      const currentState = await SchemaEngine.getCurrentDbState(verifyConn);
+      const snapshotContent = SQLParser.parse(sql);
+      const verification = SchemaEngine.verify(currentState, snapshotContent);
+
+      if (!verification.isVerified) {
+        console.warn(`[Import] Verification mismatch detected: ${JSON.stringify(verification.diff)}`);
+      }
+    } finally {
+      await ConnectionManager.closeConnection(verifyConn);
+    }
+
+    // 6. Create metadata in schemagit
+    const snapshotContent = SQLParser.parse(sql);
+
+    const snapshot = await prisma.schemaSnapshot.create({
+      data: { content: snapshotContent },
+    });
+
+    const mainBranch = await prisma.branch.create({
+      data: {
+        name: "main",
+        projectId: project.id,
+      },
+    });
+
+    const initialCommit = await prisma.commit.create({
+      data: {
+        message: "Initial import",
+        snapshotId: snapshot.id,
+        branchId: mainBranch.id,
+      },
+    });
+
+    await prisma.branch.update({
+      where: { id: mainBranch.id },
+      data: { headId: initialCommit.id },
+    });
+
+    // Final status: READY
+    await prisma.project.update({
+      where: { id: projectId },
+      data: { status: 'READY' },
+    });
+
+    const projectWithBranches = await prisma.project.findUnique({
+      where: { id: project.id },
+      include: { branches: true },
+    });
+
+    res.json({
+      project: projectWithBranches,
+      branch: mainBranch,
+      provisionedDb: dbName
+    });
+  } catch (error) {
+    console.error(error);
+
+    // Mark project as FAILED if it was created
+    try {
+      await prisma.project.update({
+        where: { id: projectId },
+        data: { status: 'FAILED' },
+      });
+    } catch (e) {
+      // project might not have been created yet
+    }
+
+    res.status(500).json({ error: "Failed to import schema" });
+  }
+
+});
+
+// Diff two branches
+
+router.get("/diff", async (req, res) => {
+  const { branchA, branchB } = req.query;
+  console.log(
+    `[Diff] Request received: branchA=${branchA}, branchB=${branchB}`,
+  );
+  try {
+    const bA = await prisma.branch.findUnique({
+      where: { id: branchA },
+      include: { head: { include: { snapshot: true } } },
+    });
+    const bB = await prisma.branch.findUnique({
+      where: { id: branchB },
+      include: { head: { include: { snapshot: true } } },
+    });
+
+    if (!bA || !bB) {
+      console.log("[Diff] Error: One or both branches not found");
+      return res.status(404).json({ error: "One or both branches not found" });
+    }
+
+    if (!bA.head || !bB.head) {
+      console.log("[Diff] Error: One or both branches have no commits");
+      return res
+        .status(400)
+        .json({ error: "One or both branches have no commits" });
+    }
+
+    if (!bA.head.snapshot || !bB.head.snapshot) {
+      console.log("[Diff] Error: One or both snapshots are missing");
+      return res
+        .status(400)
+        .json({ error: "One or both snapshots are missing" });
+    }
+
+    const contentA = bA.head.snapshot.content;
+    const contentB = bB.head.snapshot.content;
+
+    if (contentA === null || contentB === null) {
+      console.log("[Diff] Error: One or both snapshot contents are null");
+      return res
+        .status(400)
+        .json({ error: "One or both snapshot contents are null" });
+    }
+
+    console.log("[Diff] Calculating diff...");
+    const diff = SchemaEngine.diff(contentA, contentB);
+
+    const response = { diff };
+    console.log("[Diff] Success. Response:", JSON.stringify(response));
+    res.json(response);
+  } catch (error) {
+    console.error("[Diff] Critical error:", error);
+    res.status(500).json({ error: "Diff failed", details: error.message });
+  }
+});
+
+// Export a branch's schema to a .sql file
+router.get("/export", async (req, res) => {
+  const { branchId } = req.query;
+  try {
+    const branch = await prisma.branch.findUnique({
+      where: { id: branchId },
+      include: { head: { include: { snapshot: true } } },
+    });
+
+    if (!branch || !branch.head || !branch.head.snapshot) {
+      return res.status(404).json({ error: "Branch or snapshot not found" });
+    }
+
+    const snapshot = branch.head.snapshot.content;
+    const sql = SchemaEngine.generateFullSchemaSQL(snapshot);
+
+    res.attachment("schema_export.sql");
+    res.send(sql);
+  } catch (error) {
+    console.error("[Export] Critical error:", error);
+    res.status(500).json({ error: "Export failed", details: error.message });
+  }
+});
+
+// Get project details and current head
+router.get("/:id", async (req, res) => {
+  try {
+    const project = await prisma.project.findUnique({
+      where: { id: req.params.id },
+      include: {
+        branches: {
+          include: { head: { include: { snapshot: true } } },
+        },
+      },
+    });
+    res.json(project);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch project" });
+  }
+});
+
+// Create a new branch
+router.post("/branch", async (req, res) => {
+  const { name, projectId, sourceBranchId } = req.body;
+  try {
+    if (!sourceBranchId) {
+      return res.status(400).json({ error: "sourceBranchId is required" });
+    }
+
+    const sourceBranch = await prisma.branch.findUnique({
+      where: { id: sourceBranchId },
+      include: { head: true },
+    });
+
+    if (!sourceBranch) {
+      return res.status(404).json({ error: "Source branch not found" });
+    }
+
+    const newBranch = await prisma.branch.create({
+      data: {
+        name,
+        projectId,
+        headId: sourceBranch.headId ? sourceBranch.headId : null,
+      },
+    });
+
+    res.json(newBranch);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to create branch" });
+  }
+});
+
+// Commit a change to a branch
+router.post("/commit", async (req, res) => {
+  const { branchId, message, snapshot } = req.body;
+  try {
+    const branch = await prisma.branch.findUnique({
+      where: { id: branchId },
+      include: { project: true }
+    });
+    const parentId = branch.headId;
+
+    // Handle both raw SQL strings and pre-parsed snapshot objects
+    const parsedSnapshot = typeof snapshot === 'string'
+      ? SQLParser.parse(snapshot)
+      : snapshot;
+    const snapshotRecord = await prisma.schemaSnapshot.create({
+      data: { content: parsedSnapshot },
+    });
+
+    const commit = await prisma.commit.create({
+      data: {
+        message,
+        snapshotId: snapshotRecord.id,
+        branchId,
+        parentId,
+      },
+    });
+
+    await prisma.branch.update({
+      where: { id: branchId },
+      data: { headId: commit.id },
+    });
+
+    res.json(commit);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to commit change" });
+  }
+});
+
+// Merge one branch into another
+router.post("/merge", async (req, res) => {
+  const { sourceBranchId, targetBranchId } = req.body;
+  try {
+    const sourceBranch = await prisma.branch.findUnique({
+      where: { id: sourceBranchId },
+      include: { head: { include: { snapshot: true } } },
+    });
+    const targetBranch = await prisma.branch.findUnique({
+      where: { id: targetBranchId },
+      include: { head: { include: { snapshot: true } } },
+    });
+
+    if (!sourceBranch || !targetBranch) {
+      return res.status(404).json({ error: "One or both branches not found" });
+    }
+
+    if (!sourceBranch.head?.snapshot || !targetBranch.head?.snapshot) {
+      return res
+        .status(400)
+        .json({ error: "One or both branches have no commits" });
+    }
+
+    const sourceSnapshot = sourceBranch.head.snapshot.content;
+    const targetSnapshot = targetBranch.head.snapshot.content;
+
+    // 1. Find Common Ancestor (LCA) for Three-Way Merge
+    let baseSnapshot = null;
+    const sourceCommits = await prisma.commit.findMany({
+      where: { branchId: sourceBranchId },
+      orderBy: { createdAt: 'desc' }
+    });
+    const targetCommits = await prisma.commit.findMany({
+      where: { branchId: targetBranchId },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const sourceCommitIds = new Set(sourceCommits.map(c => c.id));
+    for (const commit of targetCommits) {
+      if (sourceCommitIds.has(commit.id)) {
+        const ancestorSnapshot = await prisma.schemaSnapshot.findUnique({
+          where: { id: commit.snapshotId }
+        });
+        baseSnapshot = ancestorSnapshot?.content;
+        break;
+      }
+    }
+
+    // Fallback: if no common ancestor, base is empty
+    if (!baseSnapshot) baseSnapshot = {};
+
+    // 2. Use ConflictService for Three-Way Merge
+    const { mergedSchema, conflicts } = ConflictService.detectConflicts(
+      baseSnapshot,
+      sourceSnapshot,
+      targetSnapshot
+    );
+
+    const mergeMessage = `Merged branch ${sourceBranch.name} into ${targetBranch.name}`;
+
+    if (conflicts.length > 0) {
+      return res.status(409).json({
+        error: "Merge conflicts detected",
+        conflicts,
+        mergedSnapshot: mergedSchema,
+      });
+    }
+
+    const snapshotRecord = await prisma.schemaSnapshot.create({
+      data: { content: mergedSchema },
+    });
+
+    const commit = await prisma.commit.create({
+      data: {
+        message: mergeMessage,
+        snapshotId: snapshotRecord.id,
+        branchId: targetBranchId,
+        parentId: targetBranch.headId,
+      },
+    });
+
+    await prisma.branch.update({
+      where: { id: targetBranchId },
+      data: { headId: commit.id },
+    });
+
+    res.json({
+      message: `Successfully merged ${sourceBranch.name} into ${targetBranch.name}`,
+      commit: commit,
+    });
+  } catch (error) {
+    console.error("[Merge] Critical error:", error);
+    res.status(500).json({ error: "Merge failed", details: error.message });
+  }
+});
+
+// Resolve merge conflicts and finalize merge
+router.post("/resolve", async (req, res) => {
+  const { sourceBranchId, targetBranchId, resolutions } = req.body;
+  try {
+    const sourceBranch = await prisma.branch.findUnique({
+      where: { id: sourceBranchId },
+      include: { head: { include: { snapshot: true } } },
+    });
+    const targetBranch = await prisma.branch.findUnique({
+      where: { id: targetBranchId },
+      include: { head: { include: { snapshot: true } } },
+    });
+
+    if (!sourceBranch || !targetBranch) {
+      return res.status(404).json({ error: "One or both branches not found" });
+    }
+
+    const sourceSnapshot = sourceBranch.head.snapshot.content;
+    const targetSnapshot = targetBranch.head.snapshot.content;
+
+    // Re-calculate the merge to get the mergedSchema and conflicts
+    let baseSnapshot = null;
+    const sourceCommits = await prisma.commit.findMany({
+      where: { branchId: sourceBranchId },
+      orderBy: { createdAt: 'desc' }
+    });
+    const targetCommits = await prisma.commit.findMany({
+      where: { branchId: targetBranchId },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const sourceCommitIds = new Set(sourceCommits.map(c => c.id));
+    for (const commit of targetCommits) {
+      if (sourceCommitIds.has(commit.id)) {
+        const ancestorSnapshot = await prisma.schemaSnapshot.findUnique({
+          where: { id: commit.snapshotId }
+        });
+        baseSnapshot = ancestorSnapshot?.content;
+        break;
+      }
+    }
+    if (!baseSnapshot) baseSnapshot = {};
+
+    const { mergedSchema, conflicts } = ConflictService.detectConflicts(
+      baseSnapshot,
+      sourceSnapshot,
+      targetSnapshot
+    );
+
+    // Apply resolutions to the mergedSchema
+    const finalSchema = { ...mergedSchema };
+
+    if (Array.isArray(resolutions)) {
+      resolutions.forEach((resolution, index) => {
+        const conflict = conflicts[index];
+        if (!conflict) return;
+
+        if (conflict.type === 'TABLE_CONFLICT') {
+          finalSchema[conflict.table] = resolution;
+        } else if (conflict.type === 'COLUMN_CONFLICT') {
+          const table = conflict.table;
+          const colName = conflict.column;
+          if (finalSchema[table]) {
+            const updatedCols = finalSchema[table].columns.map(col =>
+              col.name.toLowerCase() === colName.toLowerCase() ? resolution : col
+            );
+            finalSchema[table] = { ...finalSchema[table], columns: updatedCols };
+          }
+        }
+      });
+    } else if (resolutions && typeof resolutions === 'object') {
+      Object.entries(resolutions).forEach(([index, resolution]) => {
+        const conflict = conflicts[parseInt(index)];
+        if (!conflict) return;
+
+        if (conflict.type === 'TABLE_CONFLICT') {
+          finalSchema[conflict.table] = resolution;
+        } else if (conflict.type === 'COLUMN_CONFLICT') {
+          const table = conflict.table;
+          const colName = conflict.column;
+          if (finalSchema[table]) {
+            const updatedCols = finalSchema[table].columns.map(col =>
+              col.name.toLowerCase() === colName.toLowerCase() ? resolution : col
+            );
+            finalSchema[table] = { ...finalSchema[table], columns: updatedCols };
+          }
+        }
+      });
+    }
+
+    const snapshotRecord = await prisma.schemaSnapshot.create({
+      data: { content: finalSchema },
+    });
+
+    const commit = await prisma.commit.create({
+      data: {
+        message: `Resolved merge conflicts from ${sourceBranch.name} into ${targetBranch.name}`,
+        snapshotId: snapshotRecord.id,
+        branchId: targetBranchId,
+        parentId: targetBranch.headId,
+      },
+    });
+
+    await prisma.branch.update({
+      where: { id: targetBranchId },
+      data: { headId: commit.id },
+    });
+
+    res.json({
+      message: "Conflicts resolved and merged successfully",
+      commit: commit,
+    });
+  } catch (error) {
+    console.error("[Resolve] Critical error:", error);
+    res.status(500).json({ error: "Failed to resolve conflicts", details: error.message });
+  }
+});
+
+// Apply changes to the real database
+router.post("/apply", async (req, res) => {
+  const { branchId } = req.body;
+  try {
+    const branch = await prisma.branch.findUnique({
+      where: { id: branchId },
+      include: {
+        head: { include: { snapshot: true } },
+        project: true
+      },
+    });
+
+    if (!branch || !branch.head || !branch.head.snapshot) {
+      return res.status(404).json({ error: "Branch or snapshot not found" });
+    }
+
+    console.log(`[Apply] Applying branch ${branchId} to database...`);
+
+    await prisma.project.update({
+      where: { id: branch.project.id },
+      data: { status: 'VERIFYING' },
+    });
+
+    const targetDb = await ConnectionManager.getConnection(branch.project.connectionString);
+    try {
+      // 1. Get actual current DB state
+      const currentDbState = await SchemaEngine.getCurrentDbState(targetDb);
+
+      // 2. Generate a structured migration plan
+      const diff = SchemaEngine.diff(
+        currentDbState,
+        branch.head.snapshot.content,
+      );
+      const plan = SchemaEngine.generateMigrationPlan(
+        diff,
+        branch.head.snapshot.content,
+      );
+
+      if (plan.length === 0) {
+        await prisma.project.update({
+          where: { id: branch.project.id },
+          data: { status: 'READY' },
+        });
+        return res.json({ message: "Database is already up to date", plan: [] });
+      }
+
+      // 3. Execute the migration plan (handling large tables automatically)
+      const results = await ExecutionEngine.executeMigrationPlan(plan, targetDb);
+
+      // 4. VERIFY: Compare real DB state after migration with the target snapshot
+      const postMigrationState = await SchemaEngine.getCurrentDbState(targetDb);
+      const verification = SchemaEngine.verify(postMigrationState, branch.head.snapshot.content);
+
+      if (!verification.isVerified) {
+        console.error("[Apply] Verification failed. Full Diff:", JSON.stringify(verification.diff, null, 2));
+        return res.status(500).json({
+          error: "Verification failed",
+          message: "The database was updated, but the resulting state does not match the commit snapshot.",
+          diff: verification.diff
+        });
+      }
+
+      res.json({
+        message: "Schema applied and verified successfully",
+        appliedSteps: results.length,
+        details: results,
+      });
+
+      await prisma.project.update({
+        where: { id: branch.project.id },
+        data: { status: 'READY' },
+      });
+    } finally {
+      await ConnectionManager.closeConnection(targetDb);
+    }
+  } catch (error) {
+    console.error("[Apply] Critical error:", error);
+    res
+      .status(500)
+      .json({ error: "Failed to apply schema", details: error.message });
+  }
+});
+
+module.exports = router;
+const SQLParser = require('./sqlParser');
+
+class SchemaEngine {
+  // Tables used by the system for version control. Must NEVER be dropped or modified.
+  static PROTECTED_TABLES = ['Project', 'Branch', 'Commit', 'SchemaSnapshot'];
+
+  // Type normalization map to handle MySQL's internal type naming
+  static TYPE_MAP = {
+    'LONGTEXT': 'TEXT',
+    'MEDIUMTEXT': 'TEXT',
+    'TINYTEXT': 'TEXT',
+    'VARCHAR': 'TEXT',
+    'INT': 'INT',
+    'INTEGER': 'INT',
+    'BIGINT': 'INT',
+    'SMALLINT': 'INT',
+    'TINYINT': 'INT',
+    'BOOLEAN': 'TINYINT',
+    'BOOL': 'TINYINT',
+  };
+
+  static normalizeType(type) {
+    if (!type) return 'TEXT';
+    const upper = type.toUpperCase();
+    // Handle types like "varchar(255)" or "int(11)"
+    const baseType = upper.split('(')[0];
+    return this.TYPE_MAP[baseType] || baseType;
+  }
+
+  /**
+   * Generates a simple DDL string for visualization.
+   */
+  static generateDDL(diff, fullSchema = {}) {
+    const sql = [];
+
+    diff.tablesAdded.forEach(tableName => {
+      const table = fullSchema ? fullSchema[tableName] : null;
+      if (!table || !table.columns) {
+        sql.push(`-- CREATE TABLE ${tableName} (schema missing)`);
+        return;
+      }
+      const colDefs = table.columns.map(col =>
+        `  \`${col.name}\` ${col.type}${col.nullable ? '' : ' NOT NULL'}`
+      );
+      sql.push(`CREATE TABLE \`${tableName}\` (\n${colDefs.join(',\n')}\n);`);
+    });
+
+    diff.tablesDropped.forEach(table => sql.push(`DROP TABLE \`${table}\`;`));
+
+    diff.columnsAdded.forEach(({ table, column }) => {
+      sql.push(`ALTER TABLE \`${table}\` ADD COLUMN \`${column.name}\` ${column.type};`);
+    });
+
+    diff.columnsDropped.forEach(({ table, column }) => {
+      sql.push(`ALTER TABLE \`${table}\` DROP COLUMN \`${column}\`;`);
+    });
+
+    diff.columnsModified.forEach(({ table, column, new: nc }) => {
+      sql.push(`ALTER TABLE \`${table}\` MODIFY COLUMN \`${column}\` ${nc.type};`);
+    });
+
+    return sql.join('\n\n');
+  }
+
+  /**
+   * Merges two schema snapshots into one.
+   * Performs a union of tables and merges columns for common tables.
+   * @returns {{ mergedSchema: Object, conflicts: Array }}
+   */
+  static merge(snapshotA, snapshotB) {
+    const mergedSchema = {};
+    const conflicts = [];
+    const allTables = new Set([
+      ...Object.keys(snapshotA || {}),
+      ...Object.keys(snapshotB || {}),
+    ]);
+
+    for (const tableName of allTables) {
+      const tableA = snapshotA?.[tableName];
+      const tableB = snapshotB?.[tableName];
+
+      if (!tableA) {
+        mergedSchema[tableName] = tableB;
+        continue;
+      }
+      if (!tableB) {
+        mergedSchema[tableName] = tableA;
+        continue;
+      }
+
+      // Merge columns for tables present in both snapshots
+      const mergedColumns = [];
+      const colA = tableA.columns || [];
+      const colB = tableB.columns || [];
+
+      const colANames = colA.map(c => c.name.toLowerCase());
+      const colBNames = colB.map(c => c.name.toLowerCase());
+
+      // Keep all columns from A
+      mergedColumns.push(...colA);
+
+      // Add columns from B that are not in A
+      colB.forEach(cb => {
+        const matchingA = colA.find(ca => ca.name.toLowerCase() === cb.name.toLowerCase());
+        if (!matchingA) {
+          mergedColumns.push(cb);
+        } else {
+          // Check for conflicts (type or nullability difference)
+          if (this.normalizeType(matchingA.type) !== this.normalizeType(cb.type) || matchingA.nullable !== cb.nullable) {
+            conflicts.push({
+              type: 'COLUMN_CONFLICT',
+              table: tableName,
+              column: cb.name,
+              oldValue: matchingA,
+              newValue: cb,
+              message: `Conflict in table \`${tableName}\` column \`${cb.name}\`: type or nullability differs.`
+            });
+          }
+        }
+      });
+
+      mergedSchema[tableName] = {
+        ...tableA,
+        columns: mergedColumns,
+      };
+    }
+
+    return { mergedSchema, conflicts };
+  }
+
+  /**
+   * Fetches the current state of the database and converts it to a snapshot.
+   * @param {Object} dbClient - A mysql2 connection or similar client that supports .execute() or .query()
+   */
+  static async getCurrentDbState(dbClient) {
+    const [dbNameResult] = await dbClient.execute(`SELECT DATABASE() as db`);
+    const currentDb = dbNameResult[0]?.db;
+
+    if (!currentDb) {
+      console.warn('[SchemaEngine] Warning: No default database selected. State detection may be inaccurate.');
+    }
+
+    console.log(`[SchemaEngine] Detecting state for database: ${currentDb || 'UNKNOWN'}`);
+
+    const [tables] = await dbClient.execute(
+      `SELECT table_name FROM information_schema.tables WHERE table_schema = ${currentDb ? `\'${currentDb}\'` : 'NULL'}`
+    );
+
+    const state = {};
+    for (const tableRow of tables) {
+      const tableName = tableRow.TABLE_NAME || tableRow.table_name;
+      if (!tableName || this.PROTECTED_TABLES.includes(tableName)) continue;
+
+      // Get primary key columns for this table
+      const [pkRows] = await dbClient.execute(
+        `SELECT column_name FROM information_schema.key_column_usage
+         WHERE table_name = '${tableName}' AND table_schema = '${currentDb}' AND constraint_name = 'PRIMARY'`
+      );
+      const primaryKeys = new Set((pkRows.map(r => r.COLUMN_NAME || r.column_name || '')).map(n => n.toLowerCase()));
+
+      const [columns] = await dbClient.execute(
+        `SELECT column_name as name, data_type as type, is_nullable as nullable, column_default as \`default\`, extra as extra
+         FROM information_schema.columns WHERE table_name = '${tableName}' AND table_schema = '${currentDb}'`
+      );
+
+      state[tableName] = {
+        columns: columns.map(col => {
+          const colName = col.name || '';
+          const extra = col.extra || '';
+          const isAi = extra.toLowerCase().includes('auto_increment');
+
+          return {
+            name: colName,
+            type: col.type,
+            nullable: col.nullable === 'YES',
+            default: col.default,
+            autoIncrement: isAi,
+            primaryKey: primaryKeys.has(colName.toLowerCase())
+          };
+        })
+      };
+    }
+    return state;
+  }
+
+  /**
+   * Diffs two schema snapshots and returns the changes.
+   * Now includes semantic rename detection for tables and columns.
+   */
+  static diff(oldSchema, newSchema) {
+    const changes = {
+      tablesAdded: [],
+      tablesDropped: [],
+      columnsAdded: [],
+      columnsDropped: [],
+      columnsModified: [],
+    };
+
+
+    const oldTables = Object.keys(oldSchema || {});
+    const newTables = Object.keys(newSchema || {});
+
+    const oldTablesLower = oldTables.map(t => t.toLowerCase());
+    const newTablesLower = newTables.map(t => t.toLowerCase());
+
+    // Calculate Added/Dropped
+    changes.tablesAdded = newTables.filter(t =>
+      !oldTablesLower.includes(t.toLowerCase())
+    );
+    changes.tablesDropped = oldTables.filter(t =>
+      !newTablesLower.includes(t.toLowerCase())
+    );
+
+    const commonTables = oldTables.filter(t =>
+      newTablesLower.includes(t.toLowerCase())
+    );
+
+    for (const table of commonTables) {
+      const newTableName = newTables.find(t =>
+        t.toLowerCase() === table.toLowerCase()
+      );
+      if (!newTableName) continue;
+
+
+      const oldCols = oldSchema[table].columns || [];
+      const newCols = newSchema[newTableName].columns || [];
+
+      const oldColNames = oldCols.map(c => c.name.toLowerCase());
+      const newColNames = newCols.map(c => c.name.toLowerCase());
+
+      newCols.forEach((nc, idx) => {
+        if (!oldColNames.includes(nc.name.toLowerCase())) {
+          changes.columnsAdded.push({ table: newTableName, column: nc });
+        }
+      });
+
+      oldCols.forEach((oc, idx) => {
+        if (!newColNames.includes(oc.name.toLowerCase())) {
+          changes.columnsDropped.push({ table: newTableName, column: oc.name });
+        }
+      });
+
+      newCols.forEach(nc => {
+        const oc = oldCols.find(c => c.name.toLowerCase() === nc.name.toLowerCase());
+        if (oc) {
+          const typeMatch = this.normalizeType(oc.type) === this.normalizeType(nc.type);
+          const nullMatch = oc.nullable === nc.nullable;
+
+          // Special case for PKs: if it's a PK and the only difference is autoIncrement, ignore it to avoid TiDB 'Unsupported modify' error
+          const aiMatch = oc.autoIncrement === nc.autoIncrement;
+          const isPk = oc.primaryKey || nc.primaryKey;
+
+          if (!typeMatch || (!isPk && !nullMatch) || (!aiMatch && !isPk)) {
+            changes.columnsModified.push({
+              table: newTableName,
+              column: nc.name,
+              old: oc,
+              new: nc
+            });
+          }
+        }
+      });
+
+
+    }
+
+    return changes;
+  }
+
+  static isTableSemanticallyEqual(tableA, tableB) {
+    if (!tableA || !tableB) return false;
+    if (tableA.columns.length !== tableB.columns.length) return false;
+
+    // Check if all columns in A have a semantic match in B
+    return tableA.columns.every(colA =>
+      tableB.columns.some(colB => this.isColumnSemanticallyEqual(colA, colB))
+    );
+  }
+
+  static isColumnSemanticallyEqual(colA, colB) {
+    return (
+      this.normalizeType(colA.type) === this.normalizeType(colB.type) &&
+      colA.nullable === colB.nullable &&
+      colA.autoIncrement === colB.autoIncrement
+    );
+  }
+
+
+  /**
+   * Verifies if the actual database state matches the target snapshot.
+   * @param {Object} actualState - The state fetched from the real DB.
+   * @param {Object} targetSnapshot - The expected state.
+   * @returns {{ isVerified: boolean, diff: Object }}
+   */
+  static verify(actualState, targetSnapshot) {
+    const diff = this.diff(actualState, targetSnapshot);
+
+    // Verification succeeds if there are no differences
+    const isVerified =
+      diff.tablesAdded.length === 0 &&
+      diff.tablesDropped.length === 0 &&
+      diff.columnsAdded.length === 0 &&
+      diff.columnsDropped.length === 0 &&
+      diff.columnsModified.length === 0;
+
+    return { isVerified, diff };
+  }
+
+  /**
+   * Converts a schema snapshot back into a full SQL dump file.
+
+   * @param {Object} snapshot - The schema snapshot to export.
+   */
+  static generateFullSchemaSQL(snapshot) {
+    const sqlStatements = [];
+
+    for (const [tableName, tableData] of Object.entries(snapshot)) {
+      const colDefs = tableData.columns.map(col => {
+        const nullSql = col.nullable ? '' : ' NOT NULL';
+        const defaultSql = col.default ? ` DEFAULT ${col.default}` : '';
+        const aiSql = col.autoIncrement ? ' AUTO_INCREMENT' : '';
+        const pkSql = col.primaryKey ? ' PRIMARY KEY' : '';
+        return `  \`${col.name}\` ${col.type}${nullSql}${defaultSql}${aiSql}${pkSql}`;
+      });
+
+      let createTableSql = `CREATE TABLE IF NOT EXISTS \`${tableName}\` (\n${colDefs.join(',\n')}\n);`;
+
+      // Add Indexes
+      if (tableData.indexes && tableData.indexes.length > 0) {
+        tableData.indexes.forEach(idx => {
+          const cols = idx.columns.map(c => `\`${c}\``).join(', ');
+          createTableSql += `\nCREATE INDEX \`${idx.name}\` ON \`${tableName}\` (${cols});`;
+        });
+      }
+
+      // Add Constraints
+      if (tableData.constraints && tableData.constraints.length > 0) {
+        tableData.constraints.forEach(constraint => {
+          createTableSql += `\nALTER TABLE \`${tableName}\` ${constraint};`;
+        });
+      }
+
+      sqlStatements.push(createTableSql);
+    }
+
+    return sqlStatements.join('\n\n');
+  }
+
+  /**
+   * Generates a structured migration plan based on the diff.
+   */
+  static generateMigrationPlan(diff, fullSchema = {}) {
+    const plan = [];
+
+    // 1. Tables Dropped
+    diff.tablesDropped.forEach(tableName => {
+      if (!tableName || tableName === 'undefined' || this.PROTECTED_TABLES.includes(tableName)) return;
+      plan.push({
+        type: 'DROP_TABLE',
+        table: tableName,
+        sql: `DROP TABLE \`${tableName}\`;`,
+        risk: 'MEDIUM'
+      });
+    });
+
+    // 2. Tables Added
+    diff.tablesAdded.forEach(tableName => {
+      if (!tableName || tableName === 'undefined') return;
+
+      const table = fullSchema ? fullSchema[tableName] : null;
+      if (!table || !table.columns) {
+        plan.push({
+          type: 'CREATE_TABLE',
+          table: tableName,
+          sql: `-- CREATE TABLE ${tableName} (schema missing)`,
+          risk: 'LOW'
+        });
+        return;
+      }
+
+      const colDefs = table.columns.map(col => {
+        const nullSql = col.nullable ? '' : ' NOT NULL';
+        const defaultSql = col.default ? ` DEFAULT ${col.default}` : '';
+        const aiSql = col.autoIncrement ? ' AUTO_INCREMENT' : '';
+        const pkSql = col.primaryKey ? ' PRIMARY KEY' : '';
+        return `  \`${col.name}\` ${col.type}${nullSql}${defaultSql}${aiSql}${pkSql}`;
+      });
+
+      plan.push({
+        type: 'CREATE_TABLE',
+        table: tableName,
+        columns: table.columns, // Include column metadata for fallback sync
+        sql: `CREATE TABLE IF NOT EXISTS \`${tableName}\` (\n${colDefs.join(',\n')}\n);`,
+        risk: 'LOW'
+      });
+    });
+
+    // 3. Columns Added
+    diff.columnsAdded.forEach(({ table, column }) => {
+      if (!table || !column) return;
+      const nullSql = column.nullable ? '' : ' NOT NULL';
+      const defaultSql = column.default ? ` DEFAULT ${column.default}` : '';
+      plan.push({
+        type: 'ADD_COLUMN',
+        table,
+        column: column.name,
+        sql: `ALTER TABLE \`${table}\` ADD COLUMN \`${column.name}\` ${column.type} ${nullSql} ${defaultSql};`,
+        risk: 'LOW'
+      });
+    });
+
+    // 4. Columns Dropped
+    diff.columnsDropped.forEach(({ table, column }) => {
+      if (!table || !column) return;
+      plan.push({
+        type: 'DROP_COLUMN',
+        table,
+        column,
+        sql: `ALTER TABLE \`${table}\` DROP COLUMN \`${column}\`;`,
+        risk: 'LOW'
+      });
+    });
+
+    // 5. Columns Modified
+    diff.columnsModified.forEach(({ table, column, new: nc }) => {
+      if (!table || !column || !nc) return;
+      const nullSql = nc.nullable ? '' : ' NOT NULL';
+      const aiSql = nc.autoIncrement ? ' AUTO_INCREMENT' : '';
+      plan.push({
+        type: 'MODIFY_COLUMN',
+        table,
+        column,
+        sql: `ALTER TABLE \`${table}\` MODIFY COLUMN \`${column}\` ${nc.type}${nullSql}${aiSql};`,
+        risk: 'HIGH'
+      });
+    });
+
+    return plan;
+  }
+}
+
+module.exports = SchemaEngine;
+const mysql = require('mysql2/promise');
+
+class ExecutionEngine {
+  /**
+   * Executes a structured migration plan.
+   * @param {Array} plan - The migration plan from SchemaEngine.
+   * @param {Object} dbClient - A mysql2 connection.
+   */
+  static async executeMigrationPlan(plan, dbClient) {
+    const results = [];
+
+    try {
+      await dbClient.execute(`SET tidb_allow_remove_auto_inc = 1;`);
+    } catch (e) {
+      console.warn(`[Execution] Could not set tidb_allow_remove_auto_inc: ${e.message}`);
+    }
+
+    for (const step of plan) {
+      console.log(`[Execution] Processing ${step.type} on ${step.table}...`);
+
+      if (step.type === 'RENAME_TABLE') {
+        const res = await this.runStandardDDL(step.sql, dbClient);
+        results.push({ step, status: 'SUCCESS', method: 'STANDARD', result: res });
+        continue;
+      }
+
+      if (step.risk === 'HIGH') {
+        const res = await this.runOSC(step, dbClient);
+        results.push({ step, status: 'SUCCESS', method: 'OSC', result: res });
+      } else {
+        let res;
+        try {
+          res = await this.runStandardDDL(step.sql, dbClient);
+        } catch (e) {
+          if (step.type === 'CREATE_TABLE' && (e.message.includes('already exists') || e.errno === 1050)) {
+            console.log(`[Execution] Table \`${step.table}\` already exists (caught error). Synchronizing columns...`);
+            const syncResults = await this.syncColumnsForExistingTable(step.table, step.columns, dbClient);
+            results.push({
+              step,
+              status: 'SUCCESS',
+              method: 'STANDARD_WITH_SYNC',
+              result: null,
+              syncDetails: syncResults
+            });
+            continue;
+          }
+          throw e;
+        }
+
+        if (step.type === 'CREATE_TABLE' && res[0] && res[0].affectedRows === 0 && step.columns) {
+          console.log(`[Execution] Table \`${step.table}\` already exists. Synchronizing columns...`);
+          const syncResults = await this.syncColumnsForExistingTable(step.table, step.columns, dbClient);
+          results.push({
+            step,
+            status: 'SUCCESS',
+            method: 'STANDARD_WITH_SYNC',
+            result: res,
+            syncDetails: syncResults
+          });
+          continue;
+        }
+
+        results.push({ step, status: 'SUCCESS', method: 'STANDARD', result: res });
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * Ensures an existing table has all the columns defined in the target schema.
+   */
+  static async syncColumnsForExistingTable(tableName, targetColumns, dbClient) {
+    const syncResults = [];
+
+    const [dbNameResult] = await dbClient.execute(`SELECT DATABASE() as db`);
+    const currentDb = dbNameResult[0]?.db;
+
+    const [currentCols] = await dbClient.execute(
+      `SELECT column_name as name
+       FROM information_schema.columns
+       WHERE table_name = '${tableName}' AND table_schema = ${currentDb ? `\'${currentDb}\'` : 'NULL'}`
+    );
+
+    const existingColNames = currentCols.map(c => (c.COLUMN_NAME || c.name || '').toLowerCase());
+
+    for (const col of targetColumns) {
+      if (!existingColNames.includes(col.name.toLowerCase())) {
+        console.log(`[Sync] Adding missing column \`${col.name}\` to \`${tableName}\`...`);
+        const nullSql = col.nullable ? '' : ' NOT NULL';
+        const defaultSql = col.default ? ` DEFAULT ${col.default}` : '';
+        const sql = `ALTER TABLE \`${tableName}\` ADD COLUMN \`${col.name}\` ${col.type} ${nullSql} ${defaultSql};`;
+
+        try {
+          await dbClient.execute(sql);
+          syncResults.push({ column: col.name, action: 'ADDED' });
+        } catch (e) {
+          console.error(`[Sync] Failed to add column ${col.name}:`, e.message);
+          syncResults.push({ column: col.name, action: 'FAILED', error: e.message });
+        }
+      }
+    }
+
+    const targetColNames = targetColumns.map(c => c.name.toLowerCase());
+    for (const existingCol of currentCols) {
+      const colName = existingCol.COLUMN_NAME || existingCol.name;
+      if (colName && !targetColNames.includes(colName.toLowerCase())) {
+        console.log(`[Sync] Dropping obsolete column \`${colName}\` from \`${tableName}\`...`);
+        const sql = `ALTER TABLE \`${tableName}\` DROP COLUMN \`${colName}\`;`;
+;
+
+        try {
+          await dbClient.execute(sql);
+          syncResults.push({ column: colName, action: 'DROPPED' });
+        } catch (e) {
+          console.error(`[Sync] Failed to drop column ${colName}:`, e.message);
+          syncResults.push({ column: colName, action: 'DROP_FAILED', error: e.message });
+        }
+      }
+    }
+
+    return syncResults;
+  }
+
+  /**
+   * Implements a simulated Online Schema Change (OSC) pattern for large tables.
+   * Optimized for large tables by avoiding OFFSET.
+   */
+  static async runOSC(step, dbClient) {
+    const { table, sql } = step;
+    console.log(`[OSC] Starting Online Schema Change for ${table} to avoid locks...`);
+
+    const shadowTableName = `${table}_shadow`;
+    console.log(`[OSC] Creating shadow table ${shadowTableName}...`);
+
+    await dbClient.execute(`CREATE TABLE \`${shadowTableName}\` LIKE \`${table}\`;`);
+
+    const shadowSql = sql.replace(new RegExp(`\`${table}\``, 'g'), `\`${shadowTableName}\``);
+    await dbClient.execute(shadowSql);
+
+    console.log(`[OSC] Copying data in chunks using PK range...`);
+
+    const [pkResult] = await dbClient.execute(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_name = '${table}' AND column_key = 'PRI' LIMIT 1`
+    );
+    const pkColumn = pkResult[0]?.COLUMN_NAME || 'id';
+    console.log(`[OSC] Using primary key \`${pkColumn}\` for chunking`);
+
+    let lastId = null;
+    const CHUNK_SIZE = 5000;
+    let totalCopied = 0;
+
+    while (true) {
+      const query = lastId
+        ? `INSERT INTO \`${shadowTableName}\` SELECT * FROM \`${table}\` WHERE \`${pkColumn}\` > ${lastId} ORDER BY \`${pkColumn}\` ASC LIMIT ${CHUNK_SIZE}`
+        : `INSERT INTO \`${shadowTableName}\` SELECT * FROM \`${table}\` ORDER BY \`${pkColumn}\` ASC LIMIT ${CHUNK_SIZE}`;
+
+      const [result] = await dbClient.execute(query);
+      const count = result.affectedRows;
+
+      if (count === 0) break;
+
+      totalCopied += count;
+
+      const [lastIdResult] = await dbClient.execute(
+        `SELECT \`${pkColumn}\` FROM \`${shadowTableName}\` ORDER BY \`${pkColumn}\` DESC LIMIT 1`
+      );
+      lastId = lastIdResult[0] ? lastIdResult[0][pkColumn] : null;
+
+      console.log(`[OSC] Copied ${totalCopied} rows...`);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+
+    console.log(`[OSC] Swapping tables...`);
+    await dbClient.execute(`RENAME TABLE \`${table}\` TO \`${table}_old\`, \`${shadowTableName}\` TO \`${table}\`;`);
+
+    console.log(`[OSC] Cleaning up...`);
+    await dbClient.execute(`DROP TABLE \`${table}_old\`;`);
+
+    return { rowsCopied: totalCopied };
+  }
+
+  static async getTableInfo(tableName) {
+    // Query INFORMATION_SCHEMA to get data length
+    const result = await prisma.$queryRawUnsafe(
+      `SELECT data_length FROM information_schema.tables WHERE table_name = '${tableName}' AND table_schema = DATABASE()`
+    );
+    return result[0] || { data_length: 0 };
+  }
+
+  static isInstantDDL(sql) {
+    // MySQL 8.0 Instant DDL supports:
+    // - Adding a column at the end of the table
+    // - Dropping the last column
+    // - Renaming a column
+    return /ADD COLUMN.*$/i.test(sql) || /DROP COLUMN.*$/i.test(sql) || /RENAME COLUMN/i.test(sql);
+  }
+
+  static async runInstantDDL(sql) {
+    const instantSql = `${sql} ALGORITHM=INSTANT;`;
+    return prisma.$executeRawUnsafe(instantSql);
+  }
+
+  static async runStandardDDL(sql, dbClient) {
+    console.log(`[SQL Execution] Running: ${sql}`);
+    return dbClient.execute(sql);
+  }
+}
+
+module.exports = ExecutionEngine;

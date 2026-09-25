@@ -1,4 +1,5 @@
 const SchemaEngine = require('../src/engine/schemaEngine');
+const ConflictService = require('../src/services/ConflictService');
 
 describe('SchemaEngine', () => {
   const mockOldSchema = {
@@ -140,4 +141,124 @@ describe('SchemaEngine', () => {
       expect(plan[0].sql).toContain('ALTER TABLE `users` DROP COLUMN `email`');
     });
   });
+
+  describe('ConflictService Edge Cases', () => {
+    test('should detect a TABLE_CONFLICT when both branches create same table with different structures', () => {
+      const base = {};
+      const branchA = {
+        logs: { columns: [{ name: 'id', type: 'INT', nullable: false }] }
+      };
+      const branchB = {
+        logs: { columns: [{ name: 'id', type: 'INT', nullable: false, primaryKey: true }] }
+      };
+
+      const { conflicts } = ConflictService.detectConflicts(base, branchA, branchB);
+      expect(conflicts).toContainEqual(
+        expect.objectContaining({ type: 'TABLE_CONFLICT', table: 'logs' })
+      );
+    });
+
+    test('should detect a COLUMN_CONFLICT when both branches modify same column differently', () => {
+      const base = {
+        users: { columns: [{ name: 'username', type: 'TEXT', nullable: false }] }
+      };
+      const branchA = {
+        users: { columns: [{ name: 'username', type: 'INT', nullable: false }] }
+      };
+      const branchB = {
+        users: { columns: [{ name: 'username', type: 'VARCHAR', nullable: false }] }
+      };
+
+      const { conflicts } = ConflictService.detectConflicts(base, branchA, branchB);
+      expect(conflicts).toContainEqual(
+        expect.objectContaining({ type: 'COLUMN_CONFLICT', column: 'username' })
+      );
+    });
+  });
 });
+
+  describe('Advanced Diffing & Planning', () => {
+    test('should detect a column rename when types match and only one col is added/dropped', () => {
+      const oldSchema = {
+        users: {
+          columns: [
+            { name: 'id', type: 'INT', nullable: false, primaryKey: true },
+            { name: 'username', type: 'TEXT', nullable: false },
+          ]
+        }
+      };
+      const newSchema = {
+        users: {
+          columns: [
+            { name: 'id', type: 'INT', nullable: false, primaryKey: true },
+            { name: 'login', type: 'TEXT', nullable: false },
+          ]
+        }
+      };
+      const diff = SchemaEngine.diff(oldSchema, newSchema);
+      expect(diff.columnsRenamed).toContainEqual(
+        expect.objectContaining({ table: 'users', oldName: 'username', newName: 'login' })
+      );
+      expect(diff.columnsAdded).toHaveLength(0);
+      expect(diff.columnsDropped).toHaveLength(0);
+    });
+
+    test('should generate RENAME COLUMN SQL in migration plan', () => {
+      const diff = {
+        tablesAdded: [], tablesDropped: [], columnsAdded: [], columnsDropped: [], columnsModified: [],
+        columnsRenamed: [{ table: 'users', oldName: 'username', newName: 'login', column: { name: 'login', type: 'TEXT', nullable: false } }],
+        indexesAdded: [], indexesDropped: [], constraintsAdded: [], constraintsDropped: []
+      };
+      const plan = SchemaEngine.generateMigrationPlan(diff);
+      expect(plan[0].type).toBe('RENAME_COLUMN');
+      expect(plan[0].sql).toContain('ALTER TABLE `users` RENAME COLUMN `username` TO `login`');
+    });
+
+    test('should detect and plan for index changes', () => {
+      const oldSchema = {
+        users: {
+          columns: [{ name: 'id', type: 'INT', nullable: false }],
+          indexes: [{ name: 'idx_id', columns: ['id'], unique: true }]
+        }
+      };
+      const newSchema = {
+        users: {
+          columns: [{ name: 'id', type: 'INT', nullable: false }],
+          indexes: [
+            { name: 'idx_id', columns: ['id'], unique: true },
+            { name: 'idx_email', columns: ['email'], unique: false }
+          ]
+        }
+      };
+      const diff = SchemaEngine.diff(oldSchema, newSchema);
+      expect(diff.indexesAdded).toContainEqual(
+        expect.objectContaining({ table: 'users', index: expect.objectContaining({ name: 'idx_email' }) })
+      );
+      
+      const plan = SchemaEngine.generateMigrationPlan(diff);
+      expect(plan.some(p => p.type === 'ADD_INDEX')).toBe(true);
+      expect(plan.find(p => p.type === 'ADD_INDEX').sql).toContain('CREATE INDEX `idx_email` ON `users` (`email`)');
+    });
+
+    test('should detect and plan for constraint changes', () => {
+      const oldSchema = {
+        users: {
+          columns: [{ name: 'id', type: 'INT', nullable: false }],
+          constraints: []
+        }
+      };
+      const newSchema = {
+        users: {
+          columns: [{ name: 'id', type: 'INT', nullable: false }],
+          constraints: [{ name: 'uq_email', type: 'UNIQUE' }]
+        }
+      };
+      const diff = SchemaEngine.diff(oldSchema, newSchema);
+      expect(diff.constraintsAdded).toContainEqual(
+        expect.objectContaining({ table: 'users', constraint: expect.objectContaining({ name: 'uq_email' }) })
+      );
+      
+      const plan = SchemaEngine.generateMigrationPlan(diff);
+      expect(plan.some(p => p.type === 'ADD_CONSTRAINT')).toBe(true);
+    });
+  });

@@ -58,7 +58,9 @@ class SQLParser {
 
       // Column regex: `column_name` TYPE ...
       // Handles both quoted and unquoted column names
-      const colRegex = /^[`"']?([\w\.]+)[`"']?\s+([\w\(\),]+)(.*)$/i;
+      // Modified to capture types with parentheses (like ENUM, DECIMAL, VARCHAR) correctly
+      // Uses a non-greedy match for the type to avoid consuming the rest of the line
+      const colRegex = /^[`"']?([\w\.]+)[`"']?\s+([^\s\(\)]+(?:\([^\)]*\))?)(.*)$/i;
       const colMatch = trimmed.match(colRegex);
 
       if (colMatch) {
@@ -80,16 +82,32 @@ class SQLParser {
     const result = [];
     let current = '';
     let depth = 0;
+    let inQuote = false;
+    let quoteChar = '';
 
-    for (let char of block) {
-      if (char === '(') depth++;
-      if (char === ')') depth--;
-      if (char === ',' && depth === 0) {
-        result.push(current);
-        current = '';
-      } else {
-        current += char;
+    for (let i = 0; i < block.length; i++) {
+      const char = block[i];
+
+      // Handle quotes to avoid splitting inside strings
+      if ((char === "'" || char === '"' || char === '`') && (i === 0 || block[i - 1] !== '\\')) {
+        if (!inQuote) {
+          inQuote = true;
+          quoteChar = char;
+        } else if (char === quoteChar) {
+          inQuote = false;
+        }
       }
+
+      if (!inQuote) {
+        if (char === '(') depth++;
+        if (char === ')') depth--;
+        if (char === ',' && depth === 0) {
+          result.push(current);
+          current = '';
+          continue;
+        }
+      }
+      current += char;
     }
     result.push(current);
     return result;
@@ -127,7 +145,8 @@ class SQLParser {
   }
 
   static extractDefault(rest) {
-    const defaultRegex = /DEFAULT\s+([^,\s]+)/i;
+    // Match DEFAULT followed by either a quoted string or a non-space/non-comma value
+    const defaultRegex = /DEFAULT\s+('(?:[^']|'')*'|[^\s,]+)/i;
     const match = rest.match(defaultRegex);
     return match ? match[1] : null;
   }
