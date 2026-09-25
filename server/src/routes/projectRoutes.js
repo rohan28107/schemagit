@@ -118,12 +118,17 @@ router.post("/import", upload.single("sqlFile"), async (req, res) => {
     console.log('[IMPORT DEBUG] snapshotContent type:', typeof snapshotContent);
     console.log('[IMPORT DEBUG] is snapshotContent object:', typeof snapshotContent === 'object' && snapshotContent !== null);
 
+    let snapshot;
     try {
       console.log('[IMPORT DEBUG] Attempting prisma.schemaSnapshot.create...');
-      const snapshot = await prisma.schemaSnapshot.create({
+      snapshot = await prisma.schemaSnapshot.create({
         data: { content: snapshotContent },
       });
       console.log('[IMPORT DEBUG] snapshot created successfully');
+    } catch (prismaError) {
+      console.error('[IMPORT DEBUG] Prisma error during snapshot creation:', prismaError);
+      throw prismaError;
+    }
 
     const mainBranch = await prisma.branch.create({
       data: {
