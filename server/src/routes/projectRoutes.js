@@ -21,6 +21,9 @@ router.get("/health", (req, res) => {
 // Create a new project from a SQL dump
 router.post("/import", upload.single("sqlFile"), async (req, res) => {
   try {
+    console.log('[IMPORT DEBUG] content-type:', req.headers['content-type']);
+    console.log('[IMPORT DEBUG] body keys:', Object.keys(req.body || {}));
+    console.log('[IMPORT DEBUG] sql type:', typeof req.body?.sql);
     const { name } = req.body;
     let sql = req.body.sql;
 
@@ -112,10 +115,15 @@ router.post("/import", upload.single("sqlFile"), async (req, res) => {
 
     // 6. Create metadata in schemagit
     const snapshotContent = SQLParser.parse(sql);
+    console.log('[IMPORT DEBUG] snapshotContent type:', typeof snapshotContent);
+    console.log('[IMPORT DEBUG] is snapshotContent object:', typeof snapshotContent === 'object' && snapshotContent !== null);
 
-    const snapshot = await prisma.schemaSnapshot.create({
-      data: { content: snapshotContent },
-    });
+    try {
+      console.log('[IMPORT DEBUG] Attempting prisma.schemaSnapshot.create...');
+      const snapshot = await prisma.schemaSnapshot.create({
+        data: { content: snapshotContent },
+      });
+      console.log('[IMPORT DEBUG] snapshot created successfully');
 
     const mainBranch = await prisma.branch.create({
       data: {
