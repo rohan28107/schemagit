@@ -2,20 +2,34 @@ const BASE_URL = import.meta.env.VITE_API_BASE_URL;
 
 export const projectApi = {
   async importProject(name, sql, file, connectionString) {
-    const formData = new FormData();
-    formData.append("name", name);
-    formData.append("connectionString", connectionString);
-    if (file) {
-      formData.append("sqlFile", file);
-    } else if (sql) {
-      formData.append("sql", sql);
+    // Since the backend now expects JSON, we prioritize the 'sql' string.
+    // If a 'file' was provided, we need to read its content first.
+    let sqlContent = sql;
+
+    if (file && !sqlContent) {
+      sqlContent = await file.text();
+    }
+
+    if (!sqlContent) {
+      throw new Error("No SQL content provided.");
     }
 
     const res = await fetch(`${BASE_URL}/import`, {
       method: "POST",
-      body: formData,
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        name,
+        sql: sqlContent,
+        connectionString,
+      }),
     });
-    if (!res.ok) throw new Error("Import failed");
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || "Import failed");
+    }
     return res.json();
   },
 
