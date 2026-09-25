@@ -1,14 +1,28 @@
 const BASE_URL = import.meta.env.VITE_API_BASE_URL;
 
 export const projectApi = {
-  async importProject(name, sql) {
+  async importProject(name, sql, file, connectionString) {
+    const formData = new FormData();
+    formData.append("name", name);
+    formData.append("connectionString", connectionString);
+    if (file) {
+      formData.append("sqlFile", file);
+    } else if (sql) {
+      formData.append("sql", sql);
+    }
+
     const res = await fetch(`${BASE_URL}/import`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, sql }),
+      body: formData,
     });
     if (!res.ok) throw new Error("Import failed");
     return res.json();
+  },
+
+  async exportSchema(branchId) {
+    const res = await fetch(`${BASE_URL}/export?branchId=${branchId}`);
+    if (!res.ok) throw new Error("Export failed");
+    return res.blob();
   },
 
   async fetchProject(projectId) {
@@ -69,7 +83,26 @@ export const projectApi = {
     });
     if (!res.ok) {
       const data = await res.json();
-      throw new Error(data.error || "Merge failed");
+      throw {
+        response: {
+          status: res.status,
+          data: data,
+        },
+        message: data.error || "Merge failed",
+      };
+    }
+    return res.json();
+  },
+
+  async resolveConflicts({ sourceBranchId, targetBranchId, resolutions }) {
+    const res = await fetch(`${BASE_URL}/resolve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sourceBranchId, targetBranchId, resolutions }),
+    });
+    if (!res.ok) {
+      const data = await res.json();
+      throw new Error(data.error || "Failed to resolve conflicts");
     }
     return res.json();
   },

@@ -8,6 +8,7 @@ function BranchManager({
   setCompareBranchId,
   onCreateBranch,
   onMerge,
+  onExport,
   loading,
 }) {
   return (
@@ -64,6 +65,15 @@ function BranchManager({
         >
           {loading ? "Processing..." : "Create Branch"}
         </button>
+        {selectedBranchId && (
+          <button
+            onClick={() => onExport(selectedBranchId)}
+            disabled={loading}
+            className="w-full py-2 bg-gray-600 text-white rounded hover:bg-gray-700 transition-colors disabled:bg-gray-300 disabled:cursor-not-allowed"
+          >
+            {loading ? "Exporting..." : "Export Selected as .sql"}
+          </button>
+        )}
         {selectedBranchId && compareBranchId && (
           <button
             onClick={onMerge}
