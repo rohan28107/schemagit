@@ -19,22 +19,15 @@ router.get("/health", (req, res) => {
 });
 
 // Create a new project from a SQL dump
-router.post("/import", upload.single("sqlFile"), async (req, res) => {
+router.post("/import", async (req, res) => {
   try {
-    console.log('[IMPORT DEBUG] content-type:', req.headers['content-type']);
-    console.log('[IMPORT DEBUG] body keys:', Object.keys(req.body || {}));
-    console.log('[IMPORT DEBUG] sql type:', typeof req.body?.sql);
-    const { name } = req.body;
-    let sql = req.body.sql;
-
-    if (req.file) {
-      sql = req.file.buffer.toString("utf8");
-    }
+    const { name, sql: bodySql } = req.body;
+    let sql = bodySql;
 
     if (!sql) {
       return res.status(400).json({
         error:
-          "No SQL content provided. Please upload a .sql file or provide the sql string.",
+          "No SQL content provided. Please provide the sql string in the request body.",
       });
     }
 
@@ -71,7 +64,6 @@ router.post("/import", upload.single("sqlFile"), async (req, res) => {
       await ConnectionManager.closeConnection(adminConn);
     }
 
-
     // Update status to IMPORTING
     await prisma.project.update({
       where: { id: projectId },
@@ -81,14 +73,10 @@ router.post("/import", upload.single("sqlFile"), async (req, res) => {
     // 4. Execute the imported SQL against the new database to initialize it
     const projectConn = await ConnectionManager.getConnection(projectConnectionString);
     try {
-      // We execute the raw SQL to create the initial tables
-      // Note: In a production environment, we'd split the SQL into statements
-      // For now, we assume the SQL is a valid dump.
       await projectConn.query(sql);
       console.log(`[Import] Initial schema executed for ${dbName}`);
     } catch (e) {
       console.error('[Import] SQL Execution failed:', e.message);
-      // We continue, but let the user know it might need 'Apply'
     } finally {
       await ConnectionManager.closeConnection(projectConn);
     }
@@ -115,16 +103,12 @@ router.post("/import", upload.single("sqlFile"), async (req, res) => {
 
     // 6. Create metadata in schemagit
     const snapshotContent = SQLParser.parse(sql);
-    console.log('[IMPORT DEBUG] snapshotContent type:', typeof snapshotContent);
-    console.log('[IMPORT DEBUG] is snapshotContent object:', typeof snapshotContent === 'object' && snapshotContent !== null);
 
     let snapshot;
     try {
-      console.log('[IMPORT DEBUG] Attempting prisma.schemaSnapshot.create...');
       snapshot = await prisma.schemaSnapshot.create({
         data: { content: snapshotContent },
       });
-      console.log('[IMPORT DEBUG] snapshot created successfully');
     } catch (prismaError) {
       console.error('[IMPORT DEBUG] Prisma error during snapshot creation:', prismaError);
       throw prismaError;
@@ -169,7 +153,6 @@ router.post("/import", upload.single("sqlFile"), async (req, res) => {
   } catch (error) {
     console.error('[Import Error] Detailed:', error);
 
-    // Mark project as FAILED if it was created
     try {
       await prisma.project.update({
         where: { id: projectId },
@@ -181,7 +164,6 @@ router.post("/import", upload.single("sqlFile"), async (req, res) => {
 
     res.status(500).json({ error: "Failed to import schema", details: error.message });
   }
-
 });
 
 // Diff two branches
